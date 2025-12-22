@@ -6,12 +6,12 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-#define dim 32 
-#define attnHeads 4 
+#define dim 16 
+#define attnHeads 2 
 #define headDim 8
 #define ropeDenomBase 10000 
 #define ffnDimMultiplier 4 
-#define transformers 2 
+#define transformers 1 
 #define L 3
 #define vocabSize 10097
 
@@ -44,38 +44,41 @@ float* preComputedRopeTheta_DEVICE;
 
 float* x_DEVICE;
 typedef struct {
-    float* rmsNormCols;
-    float* xPostRMS1; 
+    float* x_sumByCol_RMS1;
+    float* x_postRMS1; 
     float* queries; 
     float* keys;
     float* values;
     float* queriesPostRoPE;
     float* keysPostRoPE;
-    float* KtQByHead;
-    float* sqrtMaskedKtQByHead;
-    float* maxByCol;
-    float* sumByCol;
-    float* softmaxAttn;
+    float* attnKtQByHead;
+    float* attnKtQByHeadScaledMasked;
+    float* attnByHead_maxByCol_softmax;
+    float* attnByHead_sumByCol_softmax;
+    float* attnByHead_postSoftmax;
+    float* valueScaledSoftmaxAttn;
+    float* outputProj;
+    float* outputProjPlusResidual;
+    float* outputProjPlusResidual_sumByCol_RMS2;
+    float* outputProjPlusResidual_postRMS2;
 } TransformerCalculations_DEVICE;
 
 TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
 
+// __global__?
 void getPreComputedRopeTheta(float* preComputedRopeTheta) {
-    // Math.cos(colIndex / Math.pow(NetworkMeta.ropeDenomBase, (2 * pairIndex / headDim)));
-    // (Math.sin(colIndex / Math.pow(NetworkMeta.ropeDenomBase, (2 * pairIndex / headDim))));
     int numPairs = headDim / 2;
     for (int colIndex = 0; colIndex < L; colIndex++) {
         int colOffset = colIndex * headDim;
         for (int pairIndex = 0; pairIndex < numPairs; pairIndex++) {
             float theta = colIndex * powf(ropeDenomBase, (-2.0f * pairIndex / headDim));
-            preComputedRopeTheta[colOffset + pairIndex*2] = cosf(theta);
-            preComputedRopeTheta[colOffset + pairIndex*2 + 1] = sinf(theta);            
+            preComputedRopeTheta[colOffset + pairIndex * 2] = cosf(theta);
+            preComputedRopeTheta[colOffset + pairIndex * 2 + 1] = sinf(theta);            
         }
     }
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void setInputSeqEmbeddings(float* x, int* seqTokenIndices, float* embedding_weights, int L_, int dim_) {
+__global__ void setInputSeqEmbeddings(float* x, int* seqTokenIndices, float* embedding_weights, int dim_, int L_) {
     int currentIndex = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = L_ * dim_ - 1;
 
@@ -88,12 +91,10 @@ __global__ void setInputSeqEmbeddings(float* x, int* seqTokenIndices, float* emb
     
     int tokenIndex = seqTokenIndices[lIndex];
 
-    // col-major
     x[currentIndex] = embedding_weights[tokenIndex * dim_ + coordIndex];
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void getRMSNormCols(float* rmsNormCols, float* x, int L_, int dim_) {
+__global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_, int L_) {
     int colIndex = blockIdx.x * blockDim.x + threadIdx.x;
     int maxColIndex = L_ - 1;
     
@@ -108,11 +109,10 @@ __global__ void getRMSNormCols(float* rmsNormCols, float* x, int L_, int dim_) {
         float val = x[colOffset + i];
         sumSquared += (val * val);
     }
-    rmsNormCols[colIndex] = sqrtf((sumSquared / dim_) + 1e-8);
+    rmsSumByCol[colIndex] = sqrtf((sumSquared / dim_) + 1e-8);
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void RMSNorm(float* xPostRMS1, float* x, float* rmsNormCols, float* rms1_weights, int L_, int dim_) {
+__global__ void applyRMSNorm(float* postRMSMat, float* preRMSMat, float* rmsSumByCol, float* rms_weights, int dim_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = dim_ * L_ - 1;
     
@@ -122,14 +122,12 @@ __global__ void RMSNorm(float* xPostRMS1, float* x, float* rmsNormCols, float* r
 
     int colIndex = index / dim_;
     int rowIndex = index - colIndex * dim_;
-    xPostRMS1[index] = (rms1_weights[rowIndex] * (x[index] / rmsNormCols[colIndex]));
+    postRMSMat[index] = (rms_weights[rowIndex] * (preRMSMat[index] / rmsSumByCol[colIndex]));
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void RoPE(float* keysOrValuesPostRoPE, float* keysOrValues, float* preComputedRopeTheta, int headDim_, int dim_, int L_) {
+__global__ void applyRoPE(float* keysOrValuesPostRoPE, float* keysOrValues, float* preComputedRopeTheta, int headDim_, int dim_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = dim_ * L_ - 1;
-    
     if (index > maxIndex) {
         return;
     }
@@ -153,9 +151,8 @@ __global__ void RoPE(float* keysOrValuesPostRoPE, float* keysOrValues, float* pr
     }
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void sqrtMaskAttn(float* sqrtMaskedKtQByHead, float* KtQByHead, int L_, int attnHeads_, int headDim_) {
-    int L2 = (L_ * L_);
+__global__ void getHeadDimScaledMaskedAttn(float* attnKtQByHeadScaledMasked, float* attnKtQByHead, int attnHeads_, int headDim_, int L_) {
+    int L2 = L_ * L_;
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = attnHeads_ * L2 - 1;
@@ -164,19 +161,18 @@ __global__ void sqrtMaskAttn(float* sqrtMaskedKtQByHead, float* KtQByHead, int L
     }
 
     int headIndex = index / L2;
-    int colIndex = (index - headIndex * L2) / L;
-    int rowIndex = index - headIndex * L2 - colIndex * L;
+    int colIndex = (index - headIndex * L2) / L_;
+    int rowIndex = index - headIndex * L2 - colIndex * L_;
 
     if (rowIndex > colIndex) {
-        sqrtMaskedKtQByHead[index] = 0;
+        attnKtQByHeadScaledMasked[index] = 0;
         return;
     }
 
-    sqrtMaskedKtQByHead[index] = KtQByHead[index] / sqrtf(headDim_);
+    attnKtQByHeadScaledMasked[index] = attnKtQByHead[index] / sqrtf(headDim_);
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void getColMax(float* maxByCol, float* sqrtMaskedKtQByHead, int L_, int attnHeads_) {
+__global__ void getAttnHeadsMaxByCol_softmax(float* attnByHead_maxByCol_softmax, float* attnHeadDimScaledMaskedKtQByHead, int attnHeads_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = attnHeads_ * L_ - 1;
     if (index > maxIndex) {
@@ -188,17 +184,16 @@ __global__ void getColMax(float* maxByCol, float* sqrtMaskedKtQByHead, int L_, i
     int colIndex = index - headIndex * L_;
     int colOffset = index * L_;
     for (int rowIndex = 0; rowIndex <= colIndex; rowIndex++) {
-        float val = sqrtMaskedKtQByHead[colOffset + rowIndex];
+        float val = attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex];
         if (val > colMax) {
             colMax = val;
         }
     }
 
-    maxByCol[index] = colMax;
+    attnByHead_maxByCol_softmax[index] = colMax;
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void getColSum(float* sumByCol, float* maxByCol, float* sqrtMaskedKtQByHead, int L_, int attnHeads_) {
+__global__ void getAttnHeadsSumByCol_softmax(float* attnByHead_sumByCol_softmax, float* attnHeadDimScaledMaskedKtQByHead, float* attnByHead_maxByCol_softmax, int attnHeads_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = attnHeads_ * L_ - 1;
     if (index > maxIndex) {
@@ -210,14 +205,13 @@ __global__ void getColSum(float* sumByCol, float* maxByCol, float* sqrtMaskedKtQ
     int colIndex = index - headIndex * L_;    
     int colOffset = index * L_;
     for (int rowIndex = 0; rowIndex <= colIndex; rowIndex++) {
-        sum += expf(sqrtMaskedKtQByHead[colOffset + rowIndex] - maxByCol[index]);
+        sum += expf(attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex] - attnByHead_maxByCol_softmax[index]);
     }
-    sumByCol[index] = sum;
+    attnByHead_sumByCol_softmax[index] = sum;
 }
 
-// blockIdx.x, blockDim.x, threadIdx.x
-__global__ void softmaxCols(float* softmaxAttn, float* sqrtMaskedKtQByHead, float* sumByCol, float* maxByCol, int L_, int attnHeads_) {
-    int L2 = (L_ * L_);
+__global__ void applySoftmaxToAttnHeads(float* attnByHead_postSoftmax, float* attnHeadDimScaledMaskedKtQByHead, float* sumByCol, float* maxByCol, int attnHeads_, int L_) {
+    int L2 = L_ * L_;
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = attnHeads_ * L2 - 1;
@@ -228,16 +222,43 @@ __global__ void softmaxCols(float* softmaxAttn, float* sqrtMaskedKtQByHead, floa
     int headIndex = index / L2;
     int headRelativeColIndex = (index - headIndex * L2) / L_;
     int globalColIndex = headIndex * L_ + headRelativeColIndex;
-    // int rowIndex = index - headIndex * L2 - headRelativeColIndex * L_;
     int rowIndex = index - globalColIndex * L_;
 
-
     if (rowIndex <= headRelativeColIndex) {
-        softmaxAttn[index] = (expf(sqrtMaskedKtQByHead[index] - maxByCol[globalColIndex]) / sumByCol[globalColIndex]);
+        attnByHead_postSoftmax[index] = (expf(attnHeadDimScaledMaskedKtQByHead[index] - maxByCol[globalColIndex]) / sumByCol[globalColIndex]);
         return;
     }
 
-    softmaxAttn[index] = 0;    
+    attnByHead_postSoftmax[index] = 0;    
+}
+
+__global__ void addResidualToOutputProj(float* outputProjPlusResidual, float* outputProj, float* xFromTransformerStart, int dim_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxIndex = dim_ * L_ - 1;
+    if (index > maxIndex) {
+        return;
+    }
+
+    outputProjPlusResidual[index] = outputProj[index] + xFromTransformerStart[index];
+}
+
+void printFloatMatrixToDebug(float* deviceMatrix, int matrixSize, int numValsToPrint, int numValsInPrintRow) {
+    float* debug_cpu_matix = (float*)malloc(matrixSize * sizeof(float));
+    cudaMemcpy(debug_cpu_matix, deviceMatrix, matrixSize * sizeof(float), cudaMemcpyDeviceToHost);
+    for(int i = 0; i < numValsToPrint; i++) {
+        if (i == 0) {
+            printf("[");
+        }
+        printf("%f", debug_cpu_matix[i]);
+        if (i < numValsToPrint - 1) {
+            if ((i + 1) % numValsInPrintRow == 0) {
+                printf(",\n ");
+            } else {
+                printf(", ");
+            }
+        }
+    }
+    printf("]\n\n");
 }
 
 int runInference() {
@@ -245,44 +266,15 @@ int runInference() {
     int threadsPerBlock = 256;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 
-    // __global__ void setInputSeqEmbeddings(float* x, float* seqTokenIndices, float* embedding_weights, int L, int dim) {
-    setInputSeqEmbeddings<<<numBlocks, threadsPerBlock>>>(x_DEVICE, seqTokenIndices_DEVICE, embedding_weights_DEVICE, L, dim);
-
-    float* debug_cpu_x = (float*)malloc(L * dim * sizeof(float));
-    cudaMemcpy(debug_cpu_x, x_DEVICE, L * dim * sizeof(float), cudaMemcpyDeviceToHost);
-    //printf("First 10 values of the first token embedding:\n");
-    for(int i=0; i < 10; i++) {
-    //    printf("%f ", debug_cpu_x[i]);
-    }
-    //printf("\n");
+    setInputSeqEmbeddings<<<numBlocks, threadsPerBlock>>>(x_DEVICE, seqTokenIndices_DEVICE, embedding_weights_DEVICE, dim, L);
 
     xTotalThreads = L;
-    threadsPerBlock = 256;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    // __global__ void getRMSNormCols(float* rmsNormCols, float* x, int L_, int dim_) {
-    getRMSNormCols<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].rmsNormCols, x_DEVICE, L, dim);
-
-    float* debug_cpu_rmsNormCols = (float*)malloc(L * sizeof(float));
-    cudaMemcpy(debug_cpu_rmsNormCols, transformerCalculations_DEVICE[0].rmsNormCols, L * sizeof(float), cudaMemcpyDeviceToHost);
-    //printf("First 10 values of RMS Norm of cols:\n");
-    for(int i=0; i < 10; i++) {
-    //    printf("%f ", debug_cpu_rmsNormCols[i]);
-    }
-    //printf("\n");
+    getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].x_sumByCol_RMS1, x_DEVICE, dim, L);
 
     xTotalThreads = dim * L;
-    threadsPerBlock = 256;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    // __global__ void RMSNorm(float* xPostRMS1, float* x, float* rmsNormCols, float* rms1_weights, int L_, int dim_) {
-    RMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].xPostRMS1, x_DEVICE, transformerCalculations_DEVICE[0].rmsNormCols, transformerWeights_DEVICE[0].rms1_weights, L, dim);
-
-    float* debug_cpu_xPostRMS1 = (float*)malloc(dim * L * sizeof(float));
-    cudaMemcpy(debug_cpu_xPostRMS1, transformerCalculations_DEVICE[0].xPostRMS1, dim * L * sizeof(float), cudaMemcpyDeviceToHost);
-    //printf("First 10 values of xPostRMS1:\n");
-    for(int i=0; i < 100; i++) {
-    //    printf("%f ", debug_cpu_xPostRMS1[i]);
-    }
-    //printf("\n");
+    applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].x_postRMS1, x_DEVICE, transformerCalculations_DEVICE[0].x_sumByCol_RMS1, transformerWeights_DEVICE[0].rms1_weights, dim, L);
 
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -290,156 +282,118 @@ int runInference() {
     cublasHandle_t handle;
     cublasCreate(&handle);
 
-    // C = A @ B
     cublasGemmEx(
         handle,
         CUBLAS_OP_N,
         CUBLAS_OP_N,
-        dim, // rows A & C
-        L, // cols B & C
-        dim, // cols A, rows B
+        dim, // row C
+        L, // cols C
+        dim, // contracting (shared) dim
         &alpha,
         transformerWeights_DEVICE[0].query_weights,
         CUDA_R_32F,
-        dim, // rows A
-        transformerCalculations_DEVICE[0].xPostRMS1,
+        dim, // lda, mem col size for col-major
+        transformerCalculations_DEVICE[0].x_postRMS1,
         CUDA_R_32F,
-        dim, // rows B        
+        dim, // ldb, mem col size for col-major      
         &beta,
         transformerCalculations_DEVICE[0].queries,
         CUDA_R_32F,
-        dim, // rows C
+        dim, // ldc, mem col size
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT             
     );
 
-    float* debug_cpu_queries = (float*)malloc(dim * L * sizeof(float));
-    cudaMemcpy(debug_cpu_queries, transformerCalculations_DEVICE[0].queries, dim * L * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("First 100 values of queries:\n");
-    for(int i=0; i < 100; i++) {
-        printf("%f ", debug_cpu_queries[i]);
-    }
-    printf("\n");
-
-    // C = A @ B
     cublasGemmEx(
         handle,
         CUBLAS_OP_N,
         CUBLAS_OP_N,
-        dim, // rows A & C
-        L, // cols B & C
-        dim, // cols A, rows B
+        dim, // rows C
+        L, // cols C
+        dim, // contracting (shared) dim
         &alpha,
         transformerWeights_DEVICE[0].key_weights,
         CUDA_R_32F,
-        dim, // rows A
-        transformerCalculations_DEVICE[0].xPostRMS1,
+        dim, // lda, mem col size for col-major
+        transformerCalculations_DEVICE[0].x_postRMS1,
         CUDA_R_32F,
-        dim, // rows B        
+        dim, // ldb, mem col size for col-major      
         &beta,
         transformerCalculations_DEVICE[0].keys,
         CUDA_R_32F,
-        dim, // rows C
+        dim, // ldc, mem col size
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT             
     );
 
-    // C = A @ B
     cublasGemmEx(
         handle,
         CUBLAS_OP_N,
         CUBLAS_OP_N,
-        dim, // rows A & C
-        L, // cols B & C
-        dim, // cols A, rows B
+        dim, // rows C
+        L, // cols C
+        dim, // contracting (shared) dim
         &alpha,
         transformerWeights_DEVICE[0].value_weights,
         CUDA_R_32F,
-        dim, // rows A
-        transformerCalculations_DEVICE[0].xPostRMS1,
+        dim, // lda, mem col size for col-major
+        transformerCalculations_DEVICE[0].x_postRMS1,
         CUDA_R_32F,
-        dim, // rows B        
+        dim, // ldb, mem col size for col-major        
         &beta,
         transformerCalculations_DEVICE[0].values,
         CUDA_R_32F,
-        dim, // rows C
+        dim, // ldc, mem col size
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT             
     );
 
     xTotalThreads = dim * L;
-    threadsPerBlock = 256;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;   
-    RoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].queriesPostRoPE, transformerCalculations_DEVICE[0].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
-    RoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].keysPostRoPE, transformerCalculations_DEVICE[0].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
-    float* debug_cpu_queriesPostRope = (float*)malloc(dim * L * sizeof(float));
-    cudaMemcpy(debug_cpu_queriesPostRope, transformerCalculations_DEVICE[0].queriesPostRoPE, dim * L * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("First 50 values of queries post RoPE:\n");
-    for(int i=0; i < 50; i++) {
-        printf("%f ", debug_cpu_queriesPostRope[i]);
-    }
-    printf("\n");
-    float* debug_cpu_keysPostRope = (float*)malloc(dim * L * sizeof(float));
-    cudaMemcpy(debug_cpu_keysPostRope, transformerCalculations_DEVICE[0].keysPostRoPE, dim * L * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("First 50 values of keys post RoPE:\n");
-    for(int i=0; i < 50; i++) {
-        printf("%f ", debug_cpu_keysPostRope[i]);
-    }
-    printf("\n");
+    applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].queriesPostRoPE, transformerCalculations_DEVICE[0].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
+    applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].keysPostRoPE, transformerCalculations_DEVICE[0].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
 
-    cublasStatus_t status = cublasGemmStridedBatchedEx(
+    // K.t @ Q
+    cublasGemmStridedBatchedEx(
         handle,
         CUBLAS_OP_T,
         CUBLAS_OP_N,
-        L, // m (K.t@Q rows)
-        L, // n (K.t@Q cols)
+        L, // m (K.t@Q one attn head rows)
+        L, // n (K.t@Q one attn head cols)
         headDim, // k
         &alpha,
         transformerCalculations_DEVICE[0].keysPostRoPE,
         CUDA_R_32F,
-        dim, // lda, col size in mem for col-major
-        headDim, // mem stride in K.t to reach next head
+        dim, // lda, col size in mem (but with CUBLAS_OP_T is logical row)
+        headDim, // mem stride in K.t to reach next head (with CUBLAS_OP_T moves along a logical row)
         transformerCalculations_DEVICE[0].queriesPostRoPE,
         CUDA_R_32F,
         dim, // ldb, col size in mem for col-major
         headDim, // mem stride in Q to reach next head
         &beta,
-        transformerCalculations_DEVICE[0].KtQByHead,
+        transformerCalculations_DEVICE[0].attnKtQByHead,
         CUDA_R_32F,
-        L, // ldc, col size in mem for col-major
+        L, // ldc, col size in mem
         L * L, // mem stride in K.t@Q to reach next head
         attnHeads,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT
     );
-
-    float* debug_cpu_KtQByHead = (float*)malloc(attnHeads * L * L * sizeof(float));
-    cudaMemcpy(debug_cpu_KtQByHead, transformerCalculations_DEVICE[0].KtQByHead, attnHeads * L * L * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("First 36 values of KtQByHead:\n");
-    for(int i=0; i < 36; i++) {
-        printf("%f ", debug_cpu_KtQByHead[i]);
-    }
-    printf("\n");
     
     xTotalThreads = attnHeads * L * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    // float* sqrtMaskedKtQByHead, float* KtQByHead, int L_, int attnHeads_, int headDim_  
-    sqrtMaskAttn<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].sqrtMaskedKtQByHead, transformerCalculations_DEVICE[0].KtQByHead, L, attnHeads, headDim);
+    getHeadDimScaledMaskedAttn<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[0].attnKtQByHead, attnHeads, headDim, L);
 
     xTotalThreads = attnHeads * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    // __global__ void getColMax(float* maxByCol, float* sqrtMaskedKtQByHead, int L_, int attnHeads_) {
-    getColMax<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].maxByCol, transformerCalculations_DEVICE[0].sqrtMaskedKtQByHead, L, attnHeads);
-    // __global__ void getColSum(float* sumByCol, float* maxByCol, float* sqrtMaskedKtQByHead, int L_, int attnHeads_) {    
-    getColSum<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].sumByCol, transformerCalculations_DEVICE[0].maxByCol, transformerCalculations_DEVICE[0].sqrtMaskedKtQByHead, L, attnHeads);
-
+    getAttnHeadsMaxByCol_softmax<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].attnByHead_maxByCol_softmax, transformerCalculations_DEVICE[0].attnKtQByHeadScaledMasked, attnHeads, L);
+    getAttnHeadsSumByCol_softmax<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[0].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[0].attnByHead_maxByCol_softmax, attnHeads, L);
     xTotalThreads = attnHeads * L * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
-    //__global__ void softmaxCols(float* softmaxAttn, float* sqrtMaskedKtQByHead, float* sumByCol, float* maxByCol, int L_, int attnHeads_) {
-    softmaxCols<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].softmaxAttn, transformerCalculations_DEVICE[0].sqrtMaskedKtQByHead, transformerCalculations_DEVICE[0].sumByCol, transformerCalculations_DEVICE[0].maxByCol, L, attnHeads);
+    applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].attnByHead_postSoftmax, transformerCalculations_DEVICE[0].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[0].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[0].attnByHead_maxByCol_softmax, attnHeads, L);
 
-    // V @ softmax_attn
-    cublasStatus_t status = cublasGemmStridedBatchedEx(
+    // V @ attnByHead_postSoftmax
+    cublasGemmStridedBatchedEx(
         handle,
         CUBLAS_OP_N,
         CUBLAS_OP_N,
@@ -451,19 +405,54 @@ int runInference() {
         CUDA_R_32F,
         dim, // lda, col size in mem for col-major
         headDim, // mem stride in values to reach next head
-        transformerCalculations_DEVICE[0].softmaxAttn,
+        transformerCalculations_DEVICE[0].attnByHead_postSoftmax,
         CUDA_R_32F,
         L, // ldb, col size in mem for col-major
         (L * L), // mem stride in softmaxAttn to reach next head
         &beta,
         transformerCalculations_DEVICE[0].valueScaledSoftmaxAttn,
         CUDA_R_32F,
-        headDim, // ldc, col size in mem for col-major
-        (headDim * L), // mem stride in valueScaledSoftmaxAttn to reach next head
+        dim, // ldc, fused attn heads col size in mem; would have headDim if mult. by head
+        headDim, // mem stride in valueScaledSoftmaxAttn with fused attn heads to reach next head; would have been (headDim * L) if mult.
         attnHeads,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT
-    );  
+    );
+
+    // output_proj_weights @ valueScaledSoftmaxAttn (heads already fused to dim sized cols)
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        dim, // m (C rows)
+        L, // n (C cols)
+        dim, // k (shared dim)
+        &alpha,
+        transformerWeights_DEVICE[0].output_proj_weights,
+        CUDA_R_32F,
+        dim, // lda, col size in mem for col-major
+        transformerCalculations_DEVICE[0].valueScaledSoftmaxAttn,
+        CUDA_R_32F,
+        dim, // ldb, col size in mem for col-major
+        &beta,
+        transformerCalculations_DEVICE[0].outputProj,
+        CUDA_R_32F,
+        dim, // ldc, col size in mem
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+
+    xTotalThreads = dim * L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].outputProjPlusResidual, transformerCalculations_DEVICE[0].outputProj, x_DEVICE, dim, L);
+
+    xTotalThreads = L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].outputProjPlusResidual_sumByCol_RMS2, transformerCalculations_DEVICE[0].outputProjPlusResidual, dim, L);
+    xTotalThreads = dim * L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
+    applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2, transformerCalculations_DEVICE[0].outputProjPlusResidual, transformerCalculations_DEVICE[0].outputProjPlusResidual_sumByCol_RMS2, transformerWeights_DEVICE[0].rms2_weights, dim, L);
+    printFloatMatrixToDebug(transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2, dim * L, dim * L, L);
 
     return 0;
 }
@@ -529,13 +518,6 @@ int main() {
     getPreComputedRopeTheta(preComputedRopeTheta);
     cudaMalloc((void**)&preComputedRopeTheta_DEVICE, preComputedRopeTheta_size);
     cudaMemcpy(preComputedRopeTheta_DEVICE, preComputedRopeTheta, preComputedRopeTheta_size, cudaMemcpyHostToDevice);
-    /*float* debug_cpu_preComputedRopeTheta = (float*)malloc(preComputedRopeTheta_size);
-    cudaMemcpy(debug_cpu_preComputedRopeTheta, preComputedRopeTheta_DEVICE, preComputedRopeTheta_size, cudaMemcpyDeviceToHost);
-    printf("First 10 values of preComputedRopeTheta:\n");
-    for(int i=0; i < 10; i++) {
-        printf("%f ", debug_cpu_preComputedRopeTheta[i]);
-    }
-    printf("\n");*/
 
     size_t x_size = dim * L * sizeof(float); 
     cudaMalloc((void**)&x_DEVICE, x_size);
@@ -616,26 +598,25 @@ int main() {
         cudaMalloc((void**)&currentTransformerWeights_DEVICE->ffn_right2_weights, ffn_right2_weights_size);
         cudaMemcpy(currentTransformerWeights_DEVICE->ffn_right2_weights, currentTransformerWeights->ffn_right2_weights, ffn_right2_weights_size, cudaMemcpyHostToDevice);
 
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].rmsNormCols, L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].xPostRMS1, dim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_sumByCol_RMS1, L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_postRMS1, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].values, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queriesPostRoPE, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keysPostRoPE, dim * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].KtQByHead, attnHeads * L * L * sizeof(float));        
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].sqrtMaskedKtQByHead, attnHeads * L * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].maxByCol, attnHeads * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].sumByCol, attnHeads * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].softmaxAttn, attnHeads * L * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHead, attnHeads * L * L * sizeof(float));        
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHeadScaledMasked, attnHeads * L * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_maxByCol_softmax, attnHeads * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_sumByCol_softmax, attnHeads * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_postSoftmax, attnHeads * L * L * sizeof(float));        
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].valueScaledSoftmaxAttn, dim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProj, dim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual, dim * L * sizeof(float));                
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_sumByCol_RMS2, L * sizeof(float));        
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_postRMS2, dim * L * sizeof(float));
     }
 
-    /*printf("Random sequence token indices:\n");
-    for (int i = 0; i < L; i++) {
-        printf("%d, ", seqTokenIndices[i]);
-    }*/
-
     runInference();
-
     return 0;
 }
