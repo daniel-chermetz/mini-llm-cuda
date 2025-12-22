@@ -1,8 +1,6 @@
 // nvcc inference.cu -o inference -lcublas
 // nvcc inference.cu -o inference -lcublas -gencode arch=compute_75,code=sm_75
 
-// TODO: FFN, residual, vocab matMul, vocab softmax, iterating through stack transformers
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
@@ -16,7 +14,7 @@
 #define ffnDim 32
 #define transformers 4 
 #define L 3
-#define vocabSize 10097
+#define vocabSize 10
 
 int* seqTokenIndices;
 int* seqTokenIndices_DEVICE;
@@ -69,8 +67,14 @@ typedef struct {
     float* ffn_right_2;
     float* ffn_right_postHadamard;
     float* ffn_final;
+    float* ffnPlusResidual;
 } TransformerCalculations_DEVICE;
 TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
+
+float* vocabScores_DEVICE;
+float* vocabScores_maxByCol_softmax_DEVICE;
+float* vocabScores_sumByCol_softmax_DEVICE;
+float* vocabScores_postSoftmax_DEVICE;
 
 // __global__?
 void getPreComputedRopeTheta(float* preComputedRopeTheta) {
@@ -267,6 +271,61 @@ __global__ void hadamardMultiplyFFN(float* ffn_right_postHadamard, float* ffn_ri
     }
 
     ffn_right_postHadamard[index] = ffn_right_1_postSilu[index] * ffn_right_2[index];
+}
+
+__global__ void addResidualToFFN(float* ffnPlusResidual, float* ffn_final, float* xFromTransformerStart, int dim_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxIndex = dim_ * L_ - 1;
+    if (index > maxIndex) {
+        return;
+    }
+
+    ffnPlusResidual[index] = ffn_final[index] + xFromTransformerStart[index];
+}
+
+__global__ void getVocabMaxByCol_softmax(float* vocab_maxByCol_softmax, float* vocabScores, int vocabSize_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxIndex = L_ - 1;
+    if (index > maxIndex) {
+        return;
+    }
+
+    float colMax = -1.0e20f;
+    int colOffset = index * vocabSize_;
+    for (int rowIndex = 0; rowIndex < vocabSize_; rowIndex++) {
+        float val = vocabScores[colOffset + rowIndex];
+        if (val > colMax) {
+            colMax = val;
+        }
+    }
+
+    vocab_maxByCol_softmax[index] = colMax;
+}
+
+__global__ void getVocabSumByCol_softmax(float* vocab_sumByCol_softmax, float* vocabScores, float* vocab_maxByCol_softmax, int vocabSize_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxIndex = L_ - 1;
+    if (index > maxIndex) {
+        return;
+    }
+
+    float sum = 0.0f;
+    int colOffset = index * vocabSize_;
+    for (int rowIndex = 0; rowIndex < vocabSize_; rowIndex++) {
+        sum += expf(vocabScores[colOffset + rowIndex] - vocab_maxByCol_softmax[index]);
+    }
+    vocab_sumByCol_softmax[index] = sum;
+}
+
+__global__ void applySoftmaxToVocab(float* vocabScores_postSoftmax, float* vocabScores, float* vocab_sumByCol_softmax, float* vocab_maxByCol_softmax, int vocabSize_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxIndex = vocabSize_ * L_ - 1;
+    if (index > maxIndex) {
+        return;
+    }
+
+    int colIndex = index / vocabSize_;
+    vocabScores_postSoftmax[index] = (expf(vocabScores[index] - vocab_maxByCol_softmax[colIndex]) / vocab_sumByCol_softmax[colIndex]);
 }
 
 void printFloatMatrixToDebug(float* deviceMatrix, int matrixSize, int numValsToPrint, int numValsInPrintRow) {
@@ -491,8 +550,8 @@ int runInference() {
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
         applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerWeights_DEVICE[tIndex].rms2_weights, dim, L);
-        printf("outputProjPlusResidual_postRMS2\n");
-        printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2, dim * L, dim * L, L);         
+        //printf("outputProjPlusResidual_postRMS2\n");
+        //printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2, dim * L, dim * L, L);         
 
         // ffn_right_1_weights @ outputProjPlusResidual_postRMS2
         cublasGemmEx(
@@ -571,10 +630,59 @@ int runInference() {
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
         );
-        printf("ffn_final\n");
-        printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].ffn_final, dim * L, dim * L, L);         
+        // printf("ffn_final\n");
+        // printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].ffn_final, dim * L, dim * L, L);
+
+        xTotalThreads = dim * L;
+        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+        if (tIndex == 0) {
+            addResidualToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].ffn_final, x_DEVICE, dim, L);
+        } else {
+            addResidualToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].ffn_final, transformerCalculations_DEVICE[tIndex - 1].ffn_final, dim, L);            
+        }
     }
 
+    // embedding_weights.T @ ffnPlusResidual (last transformer)
+    // embedding_weights:[dim, vocabSize] --> embedding_weights.T:[vocabSize, dim]
+    // ffnPlusResidual: [dim, L]
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        vocabSize, // m (C rows)
+        L, // n (C cols)
+        dim, // k (shared dim)
+        &alpha,
+        embedding_weights_DEVICE,
+        CUDA_R_32F,
+        dim, // lda, col size in mem for col-major
+        transformerCalculations_DEVICE[transformers - 1].ffnPlusResidual,
+        CUDA_R_32F,
+        dim, // ldb, col size in mem for col-major
+        &beta,
+        vocabScores_DEVICE,
+        CUDA_R_32F,
+        vocabSize, // ldc, col size in mem
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    printf("vocabScores_DEVICE\n");
+    printFloatMatrixToDebug(vocabScores_DEVICE, vocabSize * L, vocabSize * L, L);
+
+    xTotalThreads = L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    getVocabMaxByCol_softmax<<<numBlocks, threadsPerBlock>>>(vocabScores_maxByCol_softmax_DEVICE, vocabScores_DEVICE, vocabSize, L);
+    printf("vocabScores_maxByCol_softmax_DEVICE\n");
+    printFloatMatrixToDebug(vocabScores_maxByCol_softmax_DEVICE, L, L, 1);
+    getVocabSumByCol_softmax<<<numBlocks, threadsPerBlock>>>(vocabScores_sumByCol_softmax_DEVICE, vocabScores_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
+    printf("vocabScores_sumByCol_softmax_DEVICE\n");
+    printFloatMatrixToDebug(vocabScores_sumByCol_softmax_DEVICE, L, L, 1);
+    xTotalThreads = vocabSize * L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    applySoftmaxToVocab<<<numBlocks, threadsPerBlock>>>(vocabScores_postSoftmax_DEVICE, vocabScores_DEVICE, vocabScores_sumByCol_softmax_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
+    printf("vocabScores_postSoftmax_DEVICE\n");
+    printFloatMatrixToDebug(vocabScores_postSoftmax_DEVICE, vocabSize * L, vocabSize * L, L);
+    
     cublasDestroy(handle);
     return 0;
 }
@@ -741,8 +849,14 @@ int main() {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_postSilu, dim * ffnDimMultiplier * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_2, dim * ffnDimMultiplier * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_postHadamard, dim * ffnDimMultiplier * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_final, dim * L * sizeof(float));      
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_final, dim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffnPlusResidual, dim * L * sizeof(float));       
     }
+
+    cudaMalloc((void**)&vocabScores_DEVICE, vocabSize * L * sizeof(float));
+    cudaMalloc((void**)&vocabScores_maxByCol_softmax_DEVICE, L * sizeof(float));
+    cudaMalloc((void**)&vocabScores_sumByCol_softmax_DEVICE, L * sizeof(float));
+    cudaMalloc((void**)&vocabScores_postSoftmax_DEVICE, vocabSize * L * sizeof(float)); 
 
     runInference();
     return 0;
