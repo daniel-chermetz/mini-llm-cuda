@@ -1,0 +1,81 @@
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include "network_meta.h"
+
+typedef struct { 
+    float* rms1_weights; 
+    float* query_weights; 
+    float* key_weights; 
+    float* value_weights; 
+    float* output_proj_weights; 
+    float* rms2_weights; 
+    float* ffn_left_weights; 
+    float* ffn_right_1_weights; 
+    float* ffn_right_2_weights; 
+} TransformerWeights;
+
+typedef struct {
+    float* x_sumByCol_RMS1;
+    float* x_postRMS1; 
+    float* queries; 
+    float* keys;
+    float* values;
+    float* queriesPostRoPE;
+    float* keysPostRoPE;
+    float* attnKtQByHead;
+    float* attnKtQByHeadScaledMasked;
+    float* attnByHead_maxByCol_softmax;
+    float* attnByHead_sumByCol_softmax;
+    float* attnByHead_postSoftmax;
+    float* valueScaledSoftmaxAttn;
+    float* outputProj;
+    float* outputProjPlusResidual;
+    float* outputProjPlusResidual_sumByCol_RMS2;
+    float* outputProjPlusResidual_postRMS2;
+    float* ffn_right_1_preSilu;
+    float* ffn_right_1_postSilu;
+    float* ffn_right_2;
+    float* ffn_right_postHadamard;
+    float* ffn_final;
+    float* ffnPlusResidual;
+} TransformerCalculations_DEVICE;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern cublasHandle_t handle;
+
+extern int threadsPerBlock;
+extern float alpha;
+extern float beta;
+
+extern int* seqTokenIndices;
+extern int* seqTokenIndices_DEVICE;
+
+extern float* embedding_weights;
+extern float* embedding_weights_DEVICE;
+
+extern float* final_rms_weights;
+extern float* final_rms_weights_DEVICE;
+
+extern TransformerWeights transformerWeights[transformers];
+extern TransformerWeights transformerWeights_DEVICE[transformers];
+
+extern float* preComputedRopeTheta;
+extern float* preComputedRopeTheta_DEVICE;
+
+extern float* x_DEVICE;
+
+extern TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
+
+extern float* vocabScores_DEVICE;
+extern float* vocabScores_maxByCol_softmax_DEVICE;
+extern float* vocabScores_sumByCol_softmax_DEVICE;
+extern float* vocabScores_postSoftmax_DEVICE;
+
+#ifdef __cplusplus
+}
+#endif
