@@ -1,6 +1,3 @@
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-
 #include "network_globals.h"
 
 cublasHandle_t handle = nullptr;
@@ -27,6 +24,9 @@ float* preComputedRopeTheta_DEVICE = nullptr;
 float* x_DEVICE = nullptr;
 
 TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
+
+float* ffn_sumByCol_RMS_DEVICE = nullptr;
+float* ffn_postRMS_DEVICE = nullptr;
 
 float* vocabScores_DEVICE = nullptr;
 float* vocabScores_maxByCol_softmax_DEVICE = nullptr;

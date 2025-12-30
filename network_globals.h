@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cublas_v2.h>
+
 #include "network_meta.h"
 
 typedef struct { 
@@ -70,6 +70,9 @@ extern float* preComputedRopeTheta_DEVICE;
 extern float* x_DEVICE;
 
 extern TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
+
+extern float* ffn_sumByCol_RMS_DEVICE;
+extern float* ffn_postRMS_DEVICE;
 
 extern float* vocabScores_DEVICE;
 extern float* vocabScores_maxByCol_softmax_DEVICE;

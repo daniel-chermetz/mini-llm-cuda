@@ -15,10 +15,10 @@ __global__ void setInputSeqEmbeddings(float* x, int* seqTokenIndices, float* emb
     }
 
     int lIndex = currentIndex / dim_;
-    int coordIndex = currentIndex - lIndex * dim_;
     int tokenIndex = seqTokenIndices[lIndex];
+    int rowIndex = currentIndex - lIndex * dim_;
 
-    x[currentIndex] = embedding_weights[tokenIndex * dim_ + coordIndex];
+    x[currentIndex] = embedding_weights[tokenIndex * dim_ + rowIndex];
 }
 
 __global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_, int L_) {
@@ -245,25 +245,6 @@ __global__ void applySoftmaxToVocab(float* vocabScores_postSoftmax, float* vocab
     vocabScores_postSoftmax[index] = (expf(vocabScores[index] - vocab_maxByCol_softmax[colIndex]) / vocab_sumByCol_softmax[colIndex]);
 }
 
-void printFloatMatrixToDebug(float* deviceMatrix, int matrixSize, int numValsToPrint, int numValsInPrintRow) {
-    float* debug_cpu_matix = (float*)malloc(matrixSize * sizeof(float));
-    cudaMemcpy(debug_cpu_matix, deviceMatrix, matrixSize * sizeof(float), cudaMemcpyDeviceToHost);
-    for(int i = 0; i < numValsToPrint; i++) {
-        if (i == 0) {
-            printf("[");
-        }
-        printf("%f", debug_cpu_matix[i]);
-        if (i < numValsToPrint - 1) {
-            if ((i + 1) % numValsInPrintRow == 0) {
-                printf(",\n ");
-            } else {
-                printf(", ");
-            }
-        }
-    }
-    printf("]\n\n");
-}
-
 void getPreComputedRopeTheta(float* preComputedRopeTheta) {
     int numPairs = headDim / 2;
     for (int colIndex = 0; colIndex < L; colIndex++) {
@@ -281,21 +262,23 @@ int runInference() {
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
     setInputSeqEmbeddings<<<numBlocks, threadsPerBlock>>>(x_DEVICE, seqTokenIndices_DEVICE, embedding_weights_DEVICE, dim, L);
 
-    for (int tIndex = 0; tIndex < transformers; tIndex++) {
+    for (int tIndexCountUp = 0; tIndexCountUp < transformers; tIndexCountUp++) {
+        int tIndex = transformers - 1 - tIndexCountUp;
+
         xTotalThreads = L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        if (tIndex == 0) {
+        if (tIndex == transformers - 1) {
             getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, x_DEVICE, dim, L);
         } else {
-            getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerCalculations_DEVICE[tIndex - 1].ffn_final, dim, L);
+            getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim, L);
         }
 
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        if (tIndex == 0) {
+        if (tIndex == transformers - 1) {
             applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1, x_DEVICE, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
         } else {
-            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1, transformerCalculations_DEVICE[tIndex - 1].ffn_final, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
+            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
         }
 
         cublasGemmEx(
@@ -394,7 +377,7 @@ int runInference() {
             attnHeads,
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
-        );
+        );   
         
         xTotalThreads = attnHeads * L * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
@@ -460,11 +443,11 @@ int runInference() {
 
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        if (tIndex == 0) {
+        if (tIndex == transformers - 1) {
             addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, x_DEVICE, dim, L);
         } else {
-            addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, transformerCalculations_DEVICE[tIndex - 1].ffn_final, dim, L);
-        }
+            addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim, L);
+        }      
 
         xTotalThreads = L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
@@ -472,8 +455,6 @@ int runInference() {
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
         applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerWeights_DEVICE[tIndex].rms2_weights, dim, L);
-        //printf("outputProjPlusResidual_postRMS2\n");
-        //printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2, dim * L, dim * L, L);         
 
         // ffn_right_1_weights @ outputProjPlusResidual_postRMS2
         cublasGemmEx(
@@ -524,11 +505,7 @@ int runInference() {
         xTotalThreads = ffnDim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
         applySiluToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, transformerCalculations_DEVICE[tIndex].ffn_right_1_preSilu, ffnDim, L);
-        //printf("Silu\n");
-        //printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, ffnDim * L, ffnDim * L, L);         
         hadamardMultiplyFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard, transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, transformerCalculations_DEVICE[tIndex].ffn_right_2, ffnDim, L);
-        //printf("Hadamard\n");        
-        //printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard, ffnDim * L, ffnDim * L, L);         
 
         // ffn_left_weights @ ffn_right_weights
         cublasGemmEx(
@@ -552,20 +529,27 @@ int runInference() {
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
         );
-        // printf("ffn_final\n");
-        // printFloatMatrixToDebug(transformerCalculations_DEVICE[tIndex].ffn_final, dim * L, dim * L, L);
 
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        if (tIndex == 0) {
-            addResidualToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].ffn_final, x_DEVICE, dim, L);
-        } else {
-            addResidualToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].ffn_final, transformerCalculations_DEVICE[tIndex - 1].ffn_final, dim, L);            
-        }
+        addResidualToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].ffn_final, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, dim, L);
     }
 
-    // embedding_weights.T @ ffnPlusResidual (last transformer)
-    // embedding_weights:[dim, vocabSize] --> embedding_weights.T:[vocabSize, dim]
+    // char* filename_final_ffn_plus_residual = "final_FFN_plus_residual";
+    // saveTensorToJSON_WebGPULayout(transformerCalculations_DEVICE[0].ffnPlusResidual, dim, L, filename_final_ffn_plus_residual);
+
+    xTotalThreads = L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    getRMSColSums<<<numBlocks, threadsPerBlock>>>(ffn_sumByCol_RMS_DEVICE, transformerCalculations_DEVICE[0].ffnPlusResidual, dim, L);
+    xTotalThreads = dim * L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    applyRMSNorm<<<numBlocks, threadsPerBlock>>>(ffn_postRMS_DEVICE, transformerCalculations_DEVICE[0].ffnPlusResidual, ffn_sumByCol_RMS_DEVICE, final_rms_weights_DEVICE, dim, L);
+
+    // char* filename_ffn_post_rms = "final_FFN_postRMS_DEVICE";
+    // saveTensorToJSON_WebGPULayout(ffn_postRMS_DEVICE, dim, L, filename_ffn_post_rms);
+
+    // embedding_weights @ ffnPlusResidual (last transformer)
+    // embedding_weights:[vocabSize, dim]
     // ffnPlusResidual: [dim, L]
     cublasGemmEx(
         handle,
@@ -578,7 +562,7 @@ int runInference() {
         embedding_weights_DEVICE,
         CUDA_R_32F,
         dim, // lda, col size in mem for col-major
-        transformerCalculations_DEVICE[transformers - 1].ffnPlusResidual,
+        ffn_postRMS_DEVICE,
         CUDA_R_32F,
         dim, // ldb, col size in mem for col-major
         &beta,
@@ -588,22 +572,14 @@ int runInference() {
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT
     );
-    printf("vocabScores_DEVICE\n");
-    printFloatMatrixToDebug(vocabScores_DEVICE, vocabSize * L, vocabSize * L, L);
 
     xTotalThreads = L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
     getVocabMaxByCol_softmax<<<numBlocks, threadsPerBlock>>>(vocabScores_maxByCol_softmax_DEVICE, vocabScores_DEVICE, vocabSize, L);
-    printf("vocabScores_maxByCol_softmax_DEVICE\n");
-    printFloatMatrixToDebug(vocabScores_maxByCol_softmax_DEVICE, L, L, 1);
     getVocabSumByCol_softmax<<<numBlocks, threadsPerBlock>>>(vocabScores_sumByCol_softmax_DEVICE, vocabScores_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
-    printf("vocabScores_sumByCol_softmax_DEVICE\n");
-    printFloatMatrixToDebug(vocabScores_sumByCol_softmax_DEVICE, L, L, 1);
     xTotalThreads = vocabSize * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
     applySoftmaxToVocab<<<numBlocks, threadsPerBlock>>>(vocabScores_postSoftmax_DEVICE, vocabScores_DEVICE, vocabScores_sumByCol_softmax_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
-    printf("vocabScores_postSoftmax_DEVICE\n");
-    printFloatMatrixToDebug(vocabScores_postSoftmax_DEVICE, vocabSize * L, vocabSize * L, L);
-    
+
     return 0;
 }
