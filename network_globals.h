@@ -45,7 +45,7 @@ typedef struct {
 // training (implicitly on Device)
 // these are gradients (without specifying that in the variable name)
 typedef struct {
-    float* ffn_final;
+    float* ffn_final_plus_residual;
     float* ffn_right_postHadamard;
     float* ffn_left_weights;
     float* ffn_right_1_postSilu;
@@ -97,6 +97,10 @@ extern float* vocabScores_postSoftmax_DEVICE;
 extern float* dLoss_d_vocabScores;
 extern float* dLoss_d_ffn_final_postRMS;
 extern float* dLoss_d_embedding_weights;
+
+extern float* ffn_final_sigma_scale_x_upGrad_byCol_RMS;
+extern float* ffn_final_oneOverR_byCol_RMS;
+extern float* ffn_final_oneOverColDimR3_byCol_RMS;
 
 extern BackpropCalculations backpropCalculations[transformers];
 

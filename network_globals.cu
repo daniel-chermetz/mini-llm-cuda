@@ -42,4 +42,8 @@ float* dLoss_d_vocabScores = nullptr;
 float* dLoss_d_ffn_final_postRMS = nullptr;
 float* dLoss_d_embedding_weights = nullptr;
 
+float* ffn_final_sigma_scale_x_upGrad_byCol_RMS = nullptr;
+float* ffn_final_oneOverR_byCol_RMS = nullptr;
+float* ffn_final_oneOverColDimR3_byCol_RMS = nullptr;
+
 BackpropCalculations backpropCalculations[transformers];

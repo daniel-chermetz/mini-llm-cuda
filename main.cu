@@ -200,9 +200,13 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&dLoss_d_ffn_final_postRMS, dim * L * sizeof(float));
         cudaMalloc((void**)&dLoss_d_embedding_weights, dim * vocabSize * sizeof(float));
 
+        cudaMalloc((void**)&ffn_final_sigma_scale_x_upGrad_byCol_RMS, L * sizeof(float));
+        cudaMalloc((void**)&ffn_final_oneOverR_byCol_RMS, L * sizeof(float));
+        cudaMalloc((void**)&ffn_final_oneOverColDimR3_byCol_RMS, L * sizeof(float));
+
         // implicitly these are gradients (without specifying that in the variable name)
         for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_final, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_final_plus_residual, dim * L * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_right_postHadamard, ffnDim * L * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_left_weights, dim * ffnDim * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_right_1_postSilu, ffnDim * L * sizeof(float));
