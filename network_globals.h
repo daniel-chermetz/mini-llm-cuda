@@ -42,6 +42,16 @@ typedef struct {
     float* ffnPlusResidual;
 } TransformerCalculations_DEVICE;
 
+// training (implicitly on Device)
+// these are gradients (without specifying that in the variable name)
+typedef struct {
+    float* ffn_final;
+    float* ffn_right_postHadamard;
+    float* ffn_left_weights;
+    float* ffn_right_1_postSilu;
+    float* ffn_right_2;
+} BackpropCalculations;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -78,6 +88,17 @@ extern float* vocabScores_DEVICE;
 extern float* vocabScores_maxByCol_softmax_DEVICE;
 extern float* vocabScores_sumByCol_softmax_DEVICE;
 extern float* vocabScores_postSoftmax_DEVICE;
+
+/*
+### TRAINING ### 
+(implicitly on Device)
+*/
+
+extern float* dLoss_d_vocabScores;
+extern float* dLoss_d_ffn_final_postRMS;
+extern float* dLoss_d_embedding_weights;
+
+extern BackpropCalculations backpropCalculations[transformers];
 
 #ifdef __cplusplus
 }

@@ -32,3 +32,14 @@ float* vocabScores_DEVICE = nullptr;
 float* vocabScores_maxByCol_softmax_DEVICE = nullptr;
 float* vocabScores_sumByCol_softmax_DEVICE = nullptr;
 float* vocabScores_postSoftmax_DEVICE = nullptr;
+
+/*
+### TRAINING ### 
+(implicitly on Device)
+*/
+
+float* dLoss_d_vocabScores = nullptr;
+float* dLoss_d_ffn_final_postRMS = nullptr;
+float* dLoss_d_embedding_weights = nullptr;
+
+BackpropCalculations backpropCalculations[transformers];

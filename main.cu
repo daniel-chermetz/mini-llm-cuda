@@ -19,7 +19,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu \
 #include "load_model.h"
 #include "inference.h"
 
-void allocateMemory() {
+void allocateMemory(bool allocateTraining) {
 	cublasCreate(&handle);
 
     /* ---------------- Device info ---------------- */
@@ -53,9 +53,9 @@ void allocateMemory() {
 
     srand(0);
 
-    size_t seqTokenIndices_size = L * sizeof(int); 
+    size_t seqTokenIndices_size = (L + 1) * sizeof(int); 
     seqTokenIndices = (int*)malloc(seqTokenIndices_size);
-    for (int i = 0; i < L; i++) {
+    for (int i = 0; i < (L + 1); i++) {
         seqTokenIndices[i] = rand() % vocabSize;
     }
     cudaMalloc((void**)&seqTokenIndices_DEVICE, seqTokenIndices_size);    
@@ -193,7 +193,22 @@ void allocateMemory() {
     cudaMalloc((void**)&vocabScores_DEVICE, vocabSize * L * sizeof(float));
     cudaMalloc((void**)&vocabScores_maxByCol_softmax_DEVICE, L * sizeof(float));
     cudaMalloc((void**)&vocabScores_sumByCol_softmax_DEVICE, L * sizeof(float));
-    cudaMalloc((void**)&vocabScores_postSoftmax_DEVICE, vocabSize * L * sizeof(float)); 
+    cudaMalloc((void**)&vocabScores_postSoftmax_DEVICE, vocabSize * L * sizeof(float));
+
+    if (allocateTraining) {
+        cudaMalloc((void**)&dLoss_d_vocabScores, vocabSize * L * sizeof(float));
+        cudaMalloc((void**)&dLoss_d_ffn_final_postRMS, dim * L * sizeof(float));
+        cudaMalloc((void**)&dLoss_d_embedding_weights, dim * vocabSize * sizeof(float));
+
+        // implicitly these are gradients (without specifying that in the variable name)
+        for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_final, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_right_postHadamard, ffnDim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_left_weights, dim * ffnDim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_right_1_postSilu, ffnDim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_right_2, ffnDim * L * sizeof(float));
+        }
+    } 
 }
 
 // ============================================================================
@@ -363,9 +378,9 @@ int main(int argc, char* argv[]) {
     //char* modelName = "model_10_lr_5e6";
     //char* modelName = "model_11_lr_1e5";
     //char* modelName = "model_12_lr_4e6";
-    //char* modelName = "model_13_lr_3e6";
+    char* modelName = "model_13_lr_3e6";
     //char* modelName = "model_14_lr_3e6";
-    char* modelName = "model_15_lr_3e6";
+    //char* modelName = "model_15_lr_3e6";
     if (!loadModel(modelName)) {
         printf("Failed to load model '%s', using random weights.\n", modelName);
     }

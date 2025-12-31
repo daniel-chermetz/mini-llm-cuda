@@ -507,7 +507,7 @@ int runInference() {
         applySiluToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, transformerCalculations_DEVICE[tIndex].ffn_right_1_preSilu, ffnDim, L);
         hadamardMultiplyFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard, transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, transformerCalculations_DEVICE[tIndex].ffn_right_2, ffnDim, L);
 
-        // ffn_left_weights @ ffn_right_weights
+        // ffn_left_weights @ ffn_right_postHadamard
         cublasGemmEx(
             handle,
             CUBLAS_OP_N,
