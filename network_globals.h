@@ -46,10 +46,14 @@ typedef struct {
 // these are gradients (without specifying that in the variable name)
 typedef struct {
     float* ffn_final_plus_residual;
-    float* ffn_right_postHadamard;
     float* ffn_left_weights;
+    float* ffn_right_postHadamard;    
     float* ffn_right_1_postSilu;
+    float* ffn_right_1_preSilu;
+    float* ffn_right_1_weights;    
     float* ffn_right_2;
+    float* ffn_right_2_weights;
+    float* outputProjPlusResidual_postRMS2
 } BackpropCalculations;
 
 #ifdef __cplusplus
@@ -82,7 +86,8 @@ extern float* x_DEVICE;
 extern TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
 
 extern float* ffn_sumByCol_RMS_DEVICE;
-extern float* ffn_postRMS_DEVICE;
+extern float* ffn_postRMS_pre_gamma_DEVICE;
+extern float* ffn_postRMS_gamma_scaled_DEVICE;
 
 extern float* vocabScores_DEVICE;
 extern float* vocabScores_maxByCol_softmax_DEVICE;
@@ -95,8 +100,9 @@ extern float* vocabScores_postSoftmax_DEVICE;
 */
 
 extern float* dLoss_d_vocabScores;
-extern float* dLoss_d_ffn_final_postRMS;
 extern float* dLoss_d_embedding_weights;
+extern float* dLoss_d_ffn_final_postRMS_postGamma;
+extern float* dLoss_d_ffn_final_RMS_gamma_weights;
 
 extern float* ffn_final_sigma_scale_x_upGrad_byCol_RMS;
 extern float* ffn_final_oneOverR_byCol_RMS;
