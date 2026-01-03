@@ -15,13 +15,13 @@ __global__ void dLoss_dVocabScores_backprop(float* dLoss_d_vocabScores, float* v
 
     int tokenIndex = index / vocabSize_;
     if (tokenIndex < leftStartIndex || tokenIndex > rightEndIndex) {
-    	dLoss_d_vocabScores[index] = 0;
+    	dLoss_d_vocabScores[index] = 0.0f;
     	return;
     }
 
     int vocabIndex = index - tokenIndex * vocabSize_;
     if (vocabIndex == seqTokenIndices[tokenIndex + 1]) {
-    	dLoss_d_vocabScores[index] = vocabScores_postSoftmax[index] - 1;
+    	dLoss_d_vocabScores[index] = vocabScores_postSoftmax[index] - 1.0f;
     } else {
     	dLoss_d_vocabScores[index] = vocabScores_postSoftmax[index];
     }
@@ -35,7 +35,7 @@ __global__ void preCalcRMSColWideVals(
 	float* oneOverR_byCol_RMS, 
 	float* oneOverColDimR3_byCol_RMS, 
 	float* x_preRMS, 
-	float* x_sumByCol_RMS, 
+	float* x_sumByCol_RMS,
 	float* gamma_weights_RMS, 
 	float* upstream_grad, 
 	int colDim, 
@@ -48,8 +48,8 @@ __global__ void preCalcRMSColWideVals(
     }
 
     float x_sum_currentCol = x_sumByCol_RMS[index];
-    oneOverR_byCol_RMS[index] = 1 / x_sum_currentCol;
-    oneOverColDimR3_byCol_RMS[index] = 1 / (colDim * x_sum_currentCol * x_sum_currentCol * x_sum_currentCol);
+    oneOverR_byCol_RMS[index] = 1.0f / x_sum_currentCol;
+    oneOverColDimR3_byCol_RMS[index] = 1.0f / (colDim * x_sum_currentCol * x_sum_currentCol * x_sum_currentCol);
 
     int x_preRMS_coloffset = colDim * index;
     sigma_scale_x_upGrad_byCol_RMS[index] = 0;
@@ -59,9 +59,7 @@ __global__ void preCalcRMSColWideVals(
 }
 
 __global__ void dLoss_dPreRMSNorm(
-	float* x_post_RMS_pre_gamma_grad,
 	float* x_pre_RMS_grad,
-	float* x_post_RMS_pre_gamma,
 	float* x_pre_RMS,
 	float* sigma_scale_x_upGrad_byCol_RMS, 
 	float* oneOverR_byCol_RMS, 
@@ -87,8 +85,26 @@ __global__ void dLoss_dPreRMSNorm(
     	x_pre_RMS[index] *
     	sigma_scale_x_upGrad_byCol_RMS[colIndex] *
     	oneOverColDimR3_byCol_RMS[colIndex];
+}
 
-    x_post_RMS_pre_gamma_grad[index] = upstream_grad[index] * x_post_RMS_pre_gamma[index];
+__global__ void dLoss_d_RMS_gamma_weights(
+	x_postRMS_pre_gamma_grad,
+	x_postRMS_pre_gamma,
+	rightEndIndex,
+	upstream_grad,
+	colDim,
+	L_
+) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= colDim) {
+    	return;
+    }
+
+    x_postRMS_pre_gamma_grad[index] = 0.0f;
+    for (int colIndex = 0; colIndex <= rightEndIndex; colIndex++) {
+    	int colOffset = colIndex * colDim;
+		x_postRMS_pre_gamma_grad[index] += (x_postRMS_pre_gamma[colOffset + index] * upstream_grad[colOffset + index]);
+    }
 }
 
 __global__ void dLoss_d_ffn_right_pre_hadamard_backprop(float* dLoss_d_ffn_right_1_postSilu, float* dLoss_d_ffn_right_2, float* ffn_right_1_postSilu, float* ffn_right_2, float* dLoss_d_ffn_right_postHadamard, int ffnDim_, int L_) {
@@ -115,6 +131,16 @@ __global__ void dLoss_d_ffn_right_1_preSilu(float* dLoss_d_ffn_right_1_preSilu, 
     dLoss_d_ffn_right_1_preSilu[index] = dLoss_d_ffn_right_1_postSilu[index] * (y + sigma - y * sigma);
 }
 
+__global__ void dLoss_d_output_projection_residual_path(float* outputProjPlusResidual_backprop, float* dLoss_d_ffn_final_plus_residual, int dim_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = dim_ * L_;
+    if (index >= max) {
+    	return;
+    }
+
+    outputProjPlusResidual_backprop[index] += dLoss_d_ffn_final_plus_residual[index];
+}
+
 void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	int xTotalThreads = vocabSize * L;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
@@ -136,16 +162,16 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	// changing B[3][5] --> found in [3, 5] of backprop matrix
 	cublasGemmEx(
 	    handle,
-	    CUBLAS_OP_T,
+	    CUBLAS_OP_N,
 	    CUBLAS_OP_N,
 	    dim, // rows C
 	    L, // cols C
 	    vocabSize, // contracting (shared) dim
 	    &alpha,
-	    embedding_weights_DEVICE,
+	    embedding_weights_DEVICE, // [dim, vocabSize]
 	    CUDA_R_32F,
-	    vocabSize, // lda, mem col size for col-major
-	    dLoss_d_vocabScores,
+	    dim, // lda, mem col size for col-major
+	    dLoss_d_vocabScores, // [vocabSize, L]
 	    CUDA_R_32F,
 	    vocabSize, // ldb, mem col size for col-major      
 	    &beta,
@@ -170,14 +196,14 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	    dim, // cols C
 	    L, // contracting (shared) dim
 	    &alpha,
-	    dLoss_d_vocabScores,
+	    dLoss_d_vocabScores, // [vocabSize, L]
 	    CUDA_R_32F,
 	    vocabSize, // lda, mem col size for col-major
-	    ffn_postRMS_gamma_scaled_DEVICE,
+	    ffn_postRMS_post_gamma_DEVICE, // [L, dim]
 	    CUDA_R_32F,
 	    dim, // ldb, mem col size for col-major      
 	    &beta,
-	    dLoss_d_embedding_weights,
+	    dLoss_d_embedding_weights, // [vocabSize, dim] - correct because in the forward we multiplied by the tranpose of the embedding weights, so the gradient has the transpose shape too.
 	    CUDA_R_32F,
 	    vocabSize, // ldc, mem col size
 	    CUBLAS_COMPUTE_32F,
@@ -185,7 +211,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	);
 
 	xTotalThreads =  L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;		
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 	preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
 		ffn_final_sigma_scale_x_upGrad_byCol_RMS,
 		ffn_final_oneOverR_byCol_RMS,
@@ -197,13 +223,10 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		dim,
 		L
 	);
-
 	xTotalThreads = dim * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 	dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
-		dLoss_d_ffn_final_RMS_gamma_weights,
 		backpropCalculations[0].ffn_final_plus_residual, // pre-RMS
-		ffn_postRMS_pre_gamma_DEVICE,
 		transformerCalculations_DEVICE[0].ffnPlusResidual, // zero is actually the highest transformer (legacy from old gpu.js code, kept for compataility previously trained models)
 		ffn_final_sigma_scale_x_upGrad_byCol_RMS, 
 		ffn_final_oneOverR_byCol_RMS, 
@@ -213,6 +236,16 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		dim, 
 		L
 	);
+	xTotalThreads = dim;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
+		dLoss_d_ffn_final_RMS_gamma_weights,
+		ffn_postRMS_pre_gamma_DEVICE,
+		rightEndIndex,
+		dLoss_d_ffn_final_postRMS_postGamma,
+		dim,
+		L
+	);	
 
 	// (dLoss/d_ffn_final) * (d_ffn_final/d_ffn_right_postHadamard)
 	// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
@@ -281,12 +314,12 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	xTotalThreads = ffnDim * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 	dLoss_d_ffn_right_1_preSilu<<<numBlocks, threadsPerBlock>>>(
-		transformerCalculations_DEVICE[0].ffn_right_1_preSilu,
+		backpropCalculations[0].ffn_right_1_preSilu,
 		transformerCalculations_DEVICE[0].ffn_right_1_postSilu, 
 		transformerCalculations_DEVICE[0].ffn_right_1_preSilu,
 		backpropCalculations[0].ffn_right_1_postSilu, 
-		ffnDim_, 
-		L_
+		ffnDim,
+		L
 	);
 
 	// dL/dB = A.t @ G, dL/dA = G @ B.t
@@ -308,7 +341,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	    CUDA_R_32F,
 	    ffnDim, // ldb, mem col size for col-major      
 	    &beta,
-	    backpropCalculations[0].outputProjPlusResidual_postRMS2,
+	    backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
 	    CUDA_R_32F,
 	    dim, // ldc, mem col size
 	    CUBLAS_COMPUTE_32F,
@@ -328,7 +361,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	    backpropCalculations[0].ffn_right_1_preSilu,
 	    CUDA_R_32F,
 	    ffnDim, // lda, mem col size for col-major
-	    transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2,
+	    transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2_post_gamma,
 	    CUDA_R_32F,
 	    dim, // ldb, mem col size for col-major      
 	    &beta,
@@ -357,7 +390,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	    CUDA_R_32F,
 	    ffnDim, // ldb, mem col size for col-major      
 	    &beta_one,
-	    backpropCalculations[0].outputProjPlusResidual_postRMS2,
+	    backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
 	    CUDA_R_32F,
 	    dim, // ldc, mem col size
 	    CUBLAS_COMPUTE_32F,
@@ -377,7 +410,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	    backpropCalculations[0].ffn_right_2,
 	    CUDA_R_32F,
 	    ffnDim, // lda, mem col size for col-major
-	    transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2,
+	    transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2_post_gamma,
 	    CUDA_R_32F,
 	    dim, // ldb, mem col size for col-major      
 	    &beta,
@@ -386,5 +419,47 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	    ffnDim, // ldc, mem col size
 	    CUBLAS_COMPUTE_32F,
 	    CUBLAS_GEMM_DEFAULT             
+	);
+
+	xTotalThreads = L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
+		backpropCalculations[0].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
+		backpropCalculations[0].RMS2_oneOverR_byCol_RMS, 
+		backpropCalculations[0].RMS2_oneOverColDimR3_byCol_RMS, 
+		transformerCalculations_DEVICE[0].outputProjPlusResidual, 
+		transformerCalculations_DEVICE[0].outputProjPlusResidual_sumByCol_RMS2,
+		transformerWeights_DEVICE[0].rms2_weights, 
+		backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma, 
+		dim, L
+	);
+	xTotalThreads = dim * L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
+		backpropCalculations[0].outputProjPlusResidual,
+		transformerCalculations_DEVICE[0].outputProjPlusResidual,
+		backpropCalculations[0].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
+		backpropCalculations[0].RMS2_oneOverR_byCol_RMS, 
+		backpropCalculations[0].RMS2_oneOverColDimR3_byCol_RMS, 
+		transformerWeights_DEVICE[0].rms2_weights, 
+		backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
+		dim, L
+	);
+	xTotalThreads = dim;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
+		backpropCalculations[0].RMS2_gamma_weights,
+		transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2_pre_gamma,
+		rightEndIndex,
+		backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
+		dim, L
+	);
+
+	xTotalThreads = dim * L;
+    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	dLoss_d_output_projection_residual_path<<<numBlocks, threadsPerBlock>>>(
+		backpropCalculations[0].outputProjPlusResidual, 
+		backpropCalculations[0].ffn_final_plus_residual, 
+		dim, L
 	);
 }
