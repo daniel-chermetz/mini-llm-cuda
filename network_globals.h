@@ -18,8 +18,9 @@ typedef struct {
 
 typedef struct {
     float* x_sumByCol_RMS1;
-    float* x_postRMS1; 
-    float* queries; 
+    float* x_postRMS1_pre_gamma;
+    float* x_postRMS1_post_gamma;
+    float* queries;
     float* keys;
     float* values;
     float* queriesPostRoPE;
@@ -33,7 +34,8 @@ typedef struct {
     float* outputProj;
     float* outputProjPlusResidual;
     float* outputProjPlusResidual_sumByCol_RMS2;
-    float* outputProjPlusResidual_postRMS2;
+    float* outputProjPlusResidual_postRMS2_pre_gamma;
+    float* outputProjPlusResidual_postRMS2_post_gamma;
     float* ffn_right_1_preSilu;
     float* ffn_right_1_postSilu;
     float* ffn_right_2;
@@ -53,7 +55,8 @@ typedef struct {
     float* ffn_right_1_weights;    
     float* ffn_right_2;
     float* ffn_right_2_weights;
-    float* outputProjPlusResidual_postRMS2
+    float* outputProjPlusResidual_postRMS2;
+    float* outputProjPlusResidual;
 } BackpropCalculations;
 
 #ifdef __cplusplus
@@ -87,7 +90,7 @@ extern TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformer
 
 extern float* ffn_sumByCol_RMS_DEVICE;
 extern float* ffn_postRMS_pre_gamma_DEVICE;
-extern float* ffn_postRMS_gamma_scaled_DEVICE;
+extern float* ffn_postRMS_post_gamma_DEVICE;
 
 extern float* vocabScores_DEVICE;
 extern float* vocabScores_maxByCol_softmax_DEVICE;

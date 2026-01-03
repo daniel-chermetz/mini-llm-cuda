@@ -39,7 +39,7 @@ __global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_, int L_) {
     rmsSumByCol[colIndex] = sqrtf((sumSquared / dim_) + 1e-8);
 }
 
-__global__ void applyRMSNorm(float* postRSM_gamma_weight_scaled, float* postRMSMat, float* preRMSMat, float* rmsSumByCol, float* rms_weights, int dim_, int L_) {
+__global__ void applyRMSNorm(float* postRMS_post_gamma, float* postRMS_pre_gamma, float* preRMS, float* rmsSumByCol, float* rms_weights, int dim_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = dim_ * L_ - 1;
     
@@ -49,8 +49,8 @@ __global__ void applyRMSNorm(float* postRSM_gamma_weight_scaled, float* postRMSM
 
     int colIndex = index / dim_;
     int rowIndex = index - colIndex * dim_;
-    postRMSMat[index] = (preRMSMat[index] / rmsSumByCol[colIndex]);
-    postRSM_gamma_weight_scaled[index] = (rms_weights[rowIndex] * postRMSMat[index]);
+    postRMS_pre_gamma[index] = (preRMS[index] / rmsSumByCol[colIndex]);
+    postRMS_post_gamma[index] = (rms_weights[rowIndex] * postRMS_pre_gamma[index]);
 }
 
 __global__ void applyRoPE(float* keysOrValuesPostRoPE, float* keysOrValues, float* preComputedRopeTheta, int headDim_, int dim_, int L_) {
@@ -277,9 +277,9 @@ int runInference() {
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
         if (tIndex == transformers - 1) {
-            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1, x_DEVICE, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
+            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma, transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma, x_DEVICE, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
         } else {
-            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
+            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma, transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
         }
 
         cublasGemmEx(
@@ -293,7 +293,7 @@ int runInference() {
             transformerWeights_DEVICE[tIndex].query_weights,
             CUDA_R_32F,
             dim, // lda, mem col size for col-major
-            transformerCalculations_DEVICE[tIndex].x_postRMS1,
+            transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
             CUDA_R_32F,
             dim, // ldb, mem col size for col-major      
             &beta,
@@ -315,7 +315,7 @@ int runInference() {
             transformerWeights_DEVICE[tIndex].key_weights,
             CUDA_R_32F,
             dim, // lda, mem col size for col-major
-            transformerCalculations_DEVICE[tIndex].x_postRMS1,
+            transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
             CUDA_R_32F,
             dim, // ldb, mem col size for col-major      
             &beta,
@@ -337,7 +337,7 @@ int runInference() {
             transformerWeights_DEVICE[tIndex].value_weights,
             CUDA_R_32F,
             dim, // lda, mem col size for col-major
-            transformerCalculations_DEVICE[tIndex].x_postRMS1,
+            transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
             CUDA_R_32F,
             dim, // ldb, mem col size for col-major        
             &beta,
@@ -455,7 +455,13 @@ int runInference() {
         getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, dim, L);
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
-        applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerWeights_DEVICE[tIndex].rms2_weights, dim, L);
+        applyRMSNorm<<<numBlocks, threadsPerBlock>>>(
+            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_pre_gamma,
+            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual,
+            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2,
+            transformerWeights_DEVICE[tIndex].rms2_weights, dim, L
+        );
 
         // ffn_right_1_weights @ outputProjPlusResidual_postRMS2
         cublasGemmEx(
@@ -469,7 +475,7 @@ int runInference() {
             transformerWeights_DEVICE[tIndex].ffn_right_1_weights,
             CUDA_R_32F,
             ffnDim, // lda, col size in mem for col-major
-            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2,
+            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
             CUDA_R_32F,
             dim, // ldb, col size in mem for col-major
             &beta,
@@ -492,7 +498,7 @@ int runInference() {
             transformerWeights_DEVICE[tIndex].ffn_right_2_weights,
             CUDA_R_32F,
             ffnDim, // lda, col size in mem for col-major
-            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2,
+            transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
             CUDA_R_32F,
             dim, // ldb, col size in mem for col-major
             &beta,
@@ -544,13 +550,20 @@ int runInference() {
     getRMSColSums<<<numBlocks, threadsPerBlock>>>(ffn_sumByCol_RMS_DEVICE, transformerCalculations_DEVICE[0].ffnPlusResidual, dim, L);
     xTotalThreads = dim * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    applyRMSNorm<<<numBlocks, threadsPerBlock>>>(ffn_postRMS_gamma_scaled_DEVICE, ffn_postRMS_pre_gamma_DEVICE, transformerCalculations_DEVICE[0].ffnPlusResidual, ffn_sumByCol_RMS_DEVICE, final_rms_weights_DEVICE, dim, L);
+    applyRMSNorm<<<numBlocks, threadsPerBlock>>>(
+        ffn_postRMS_post_gamma_DEVICE,
+        ffn_postRMS_pre_gamma_DEVICE,
+        transformerCalculations_DEVICE[0].ffnPlusResidual,
+        ffn_sumByCol_RMS_DEVICE,
+        final_rms_weights_DEVICE,
+        dim, L
+    );
 
     // char* filename_ffn_post_rms = "final_FFN_postRMS_DEVICE";
     // saveTensorToJSON_WebGPULayout(ffn_postRMS_DEVICE, dim, L, filename_ffn_post_rms);
 
-    // embedding_weights @ ffnPlusResidual (last transformer)
-    // embedding_weights:[vocabSize, dim]
+    // embedding_weights.T @ ffnPlusResidual (last transformer)
+    // embedding_weights.T: [vocabSize, dim]
     // ffnPlusResidual: [dim, L]
     cublasGemmEx(
         handle,
