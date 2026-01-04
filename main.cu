@@ -138,25 +138,25 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&currentTransformerWeights_DEVICE->rms2_weights, rms2_weights_size);
         cudaMemcpy(currentTransformerWeights_DEVICE->rms2_weights, currentTransformerWeights->rms2_weights, rms2_weights_size, cudaMemcpyHostToDevice);
 
-        size_t ffn_left_weights_size = dim * dim * ffnDimMultiplier * sizeof(float);
+        size_t ffn_left_weights_size = dim * ffnDim * sizeof(float);
         currentTransformerWeights->ffn_left_weights = (float*)malloc(ffn_left_weights_size);
-        for (int i = 0; i < dim * dim * ffnDimMultiplier; i++) {
+        for (int i = 0; i < dim * ffnDim; i++) {
             currentTransformerWeights->ffn_left_weights[i] = ((float)rand() / (float)RAND_MAX);
         }
         cudaMalloc((void**)&currentTransformerWeights_DEVICE->ffn_left_weights, ffn_left_weights_size);        
         cudaMemcpy(currentTransformerWeights_DEVICE->ffn_left_weights, currentTransformerWeights->ffn_left_weights, ffn_left_weights_size, cudaMemcpyHostToDevice);
 
-        size_t ffn_right_1_weights_size = dim * ffnDimMultiplier * dim * sizeof(float);
+        size_t ffn_right_1_weights_size = dim * ffnDim * sizeof(float);
         currentTransformerWeights->ffn_right_1_weights = (float*)malloc(ffn_right_1_weights_size);
-        for (int i = 0; i < dim * dim * ffnDimMultiplier; i++) {
+        for (int i = 0; i < dim * ffnDim; i++) {
             currentTransformerWeights->ffn_right_1_weights[i] = ((float)rand() / (float)RAND_MAX);
         }   
         cudaMalloc((void**)&currentTransformerWeights_DEVICE->ffn_right_1_weights, ffn_right_1_weights_size);        
         cudaMemcpy(currentTransformerWeights_DEVICE->ffn_right_1_weights, currentTransformerWeights->ffn_right_1_weights, ffn_right_1_weights_size, cudaMemcpyHostToDevice);
 
-        size_t ffn_right_2_weights_size = dim * ffnDimMultiplier * dim * sizeof(float);
+        size_t ffn_right_2_weights_size = dim * ffnDim * sizeof(float);
         currentTransformerWeights->ffn_right_2_weights = (float*)malloc(ffn_right_2_weights_size); 
-        for (int i = 0; i < dim * dim * ffnDimMultiplier; i++) {
+        for (int i = 0; i < dim * ffnDim; i++) {
             currentTransformerWeights->ffn_right_2_weights[i] = ((float)rand() / (float)RAND_MAX);
         }
         cudaMalloc((void**)&currentTransformerWeights_DEVICE->ffn_right_2_weights, ffn_right_2_weights_size);
@@ -181,10 +181,10 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_sumByCol_RMS2, L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_postRMS2_pre_gamma, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_postRMS2_post_gammma, dim * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_preSilu, dim * ffnDimMultiplier * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_postSilu, dim * ffnDimMultiplier * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_2, dim * ffnDimMultiplier * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_postHadamard, dim * ffnDimMultiplier * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_preSilu, ffnDim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_postSilu, ffnDim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_2, ffnDim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_postHadamard, ffnDim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_final, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffnPlusResidual, dim * L * sizeof(float));
     }
@@ -231,6 +231,12 @@ void allocateMemory(bool allocateTraining) {
             cudaMalloc((void**)&backpropCalculations[transformerIndex].RMS2_oneOverColDimR3_byCol_RMS, L * sizeof(float));
             
             cudaMalloc((void**)&backpropCalculations[transformerIndex].outputProjPlusResidual, dim * L * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].valueScaledSoftmaxAttn, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].output_proj_weights, dim * dim * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].values, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnByHead_postSoftmax, attnHeads * L * L * sizeof(float));            
         }
     }
 }

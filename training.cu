@@ -462,4 +462,109 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		backpropCalculations[0].ffn_final_plus_residual, 
 		dim, L
 	);
+
+	// dL/dB = A.t [dim, dim] @ G [dim, L]
+	// (dLoss / d_outputProjPlusResidual) / (d_outputProjPlusResidual / d_valueScaledSoftmaxAttn)
+	cublasGemmEx(
+	    handle,
+	    CUBLAS_OP_T,
+	    CUBLAS_OP_N,
+	    dim, // rows C
+	    L, // cols C
+	    dim, // contracting (shared) dim
+	    &alpha,
+	    transformerWeights_DEVICE[0].output_proj_weights,
+	    CUDA_R_32F,
+	    dim, // lda, mem col size for col-major
+	    backpropCalculations[0].outputProjPlusResidual,
+	    CUDA_R_32F,
+	    dim, // ldb, mem col size for col-major
+	    &beta,
+	    backpropCalculations[0].valueScaledSoftmaxAttn,
+	    CUDA_R_32F,
+	    dim, // ldc, mem col size
+	    CUBLAS_COMPUTE_32F,
+	    CUBLAS_GEMM_DEFAULT             
+	);
+
+	// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
+	// (dLoss / d_outputProjPlusResidual) / (d_outputProjPlusResidual / d_output_proj_weights)
+	cublasGemmEx(
+	    handle,
+	    CUBLAS_OP_N,
+	    CUBLAS_OP_T,
+	    dim, // rows C
+	    dim, // cols C
+	    L, // contracting (shared) dim
+	    &alpha,
+	    backpropCalculations[0].outputProjPlusResidual,
+	    CUDA_R_32F,
+	    dim, // lda, mem col size for col-major
+	    transformerCalculations_DEVICE[0].valueScaledSoftmaxAttn,
+	    CUDA_R_32F,
+	    dim, // ldb, mem col size for col-major
+	    &beta,
+	    backpropCalculations[0].output_proj_weights,
+	    CUDA_R_32F,
+	    dim, // ldc, mem col size
+	    CUBLAS_COMPUTE_32F,
+	    CUBLAS_GEMM_DEFAULT             
+	);
+
+	// dL/dA [dim, L] = G [dim, L] @ B.t [L, L]
+	// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_values)	
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_T,
+        headDim, // rows C 
+        L, // cols C
+        L, // contracting (shared) dim
+        &alpha,
+        backpropCalculations[0].valueScaledSoftmaxAttn,
+        CUDA_R_32F,
+        dim, // lda, mem col size
+        headDim, // mem stride to reach next head
+        transformerCalculations_DEVICE[0].attnByHead_postSoftmax,
+        CUDA_R_32F,
+        L, // ldb, col size in mem for col-major
+        (L * L), // mem stride to reach next head
+        &beta,
+        backpropCalculations[0].values,
+        CUDA_R_32F,
+        dim, // ldc, col size in mem
+        headDim, // mem stride to reach next head
+        attnHeads,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+
+    // CRITICAL: must mask to zero where row > col (in a later kernel, together with pre-softmax)
+	// dL/dB [L, L] = A.t [L, headDim] @ G [headDim, L]
+	// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_attnByHead_postSoftmax)	
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        L, // rows C 
+        L, // cols C
+        headDim, // contracting (shared) dim
+        &alpha,
+        transformerCalculations_DEVICE[0].values,
+        CUDA_R_32F,
+        dim, // lda, mem col size
+        headDim, // mem stride to reach next head
+        backpropCalculations[0].valueScaledSoftmaxAttn,
+        CUDA_R_32F,
+        dim, // ldb, col size in mem for col-major
+        headDim, // mem stride to reach next head
+        &beta,
+        backpropCalculations[0].attnByHead_postSoftmax,
+        CUDA_R_32F,
+        L, // ldc, col size in mem
+        L * L, // mem stride to reach next head
+        attnHeads,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
 }
