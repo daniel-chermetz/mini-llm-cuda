@@ -141,6 +141,47 @@ __global__ void dLoss_d_output_projection_residual_path(float* outputProjPlusRes
     outputProjPlusResidual_backprop[index] += dLoss_d_ffn_final_plus_residual[index];
 }
 
+__global__ void preCalcSoftmaxGradSumByCol(float* softmaxGradSumByCol, float* attnByHead_postSoftmax, float* attnByHead_postSoftmax_upGrad, int attnHeads_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = attnHeads_ * L_;
+    if (index >= max) {
+    	return;
+    }
+
+    int attnHeadIndex = index / L_;
+    int headRelativeColIndex = index - attnHeadIndex * L_;
+    int attnHeadOffset = attnHeadIndex * (L_ * L_);
+    int globalColOffset = attnHeadOffset + headRelativeColIndex * L_;
+
+    float sum = 0.0f;
+    for (int rowIndex = 0; rowIndex <= headRelativeColIndex; rowIndex++) {
+    	sum += attnByHead_postSoftmax[globalColOffset + rowIndex] * attnByHead_postSoftmax_upGrad[globalColOffset + rowIndex];
+    }
+    softmaxGradSumByCol[index] = sum;
+}
+
+__global__ void dLoss_d_pre_softmax_pre_div_by_sqrt_head_dim(float* preSoftmax_preDivSqrtHeadDim_grad, float* attnByHead_postSoftmax, float* softmaxGradSumByCol, float* attnByHead_postSoftmax_upGrad, int attnHeads_, int headDim_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = attnHeads_ * L_ * L_;
+    if (index >= max) {
+    	return;
+    }
+
+    int globalColIndex = index / L_;
+    int attnHeadIndex = globalColIndex / L_;
+    int headRelativeColIndex = globalColIndex - attnHeadIndex * L_;
+    int rowIndex = index - globalColIndex * L_;
+
+    if (rowIndex > headRelativeColIndex) {
+    	// causal masking
+    	preSoftmax_preDivSqrtHeadDim_grad[index] = 0;
+    	return;
+    }
+
+    float invSqrtHeadDim = 1.0f / sqrtf((float)headDim_);
+    preSoftmax_preDivSqrtHeadDim_grad[index] = invSqrtHeadDim * (attnByHead_postSoftmax[index] * attnByHead_postSoftmax_upGrad[index] - attnByHead_postSoftmax[index] * softmaxGradSumByCol[globalColIndex]);
+}
+
 void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	int xTotalThreads = vocabSize * L;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
