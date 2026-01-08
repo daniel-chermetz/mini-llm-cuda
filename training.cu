@@ -285,26 +285,26 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	// (dLoss/dVocabScores)[3rd row] @ ffn_postRMS_DEVICE.T[5th col - has been been 5th row] of the result
 	// changing A[3][5] --> found in [3, 5] of backprop matrix
 
-	// dL/d(A.t) = dL/dC * dC / d(A.t) = G * B.t,
-	// dL/dA = dL/dC * dC / d(A) = B * G.t
+	// dL/d(A_forward_pass) = dL/dC * dC / d(A_forward_pass) = G * B.t,
+	// dL/d(A_forward_pass_transpose) = dL/dC * dC / d(A_forward_pass_transpose) = B [dim, L] * G.t [L, vocabSize]
 	cublasGemmEx(
 	    handle,
 	    CUBLAS_OP_N,
 	    CUBLAS_OP_T,
-	    vocabSize, // rows C
-	    dim, // cols C
+	    dim, // rows C
+	    vocabSize, // cols C
 	    L, // contracting (shared) dim
 	    &alpha,
-	    dLoss_d_vocabScores, // [vocabSize, L]
+	    ffn_postRMS_post_gamma_DEVICE,
 	    CUDA_R_32F,
-	    vocabSize, // lda, mem col size for col-major
-	    ffn_postRMS_post_gamma_DEVICE, // [L, dim]
+	    dim, // lda, mem col size for col-major
+	    dLoss_d_vocabScores, // [vocanSize, L].t
 	    CUDA_R_32F,
-	    dim, // ldb, mem col size for col-major      
+	    vocabSize, // ldb, mem col size for col-major      
 	    &beta,
-	    dLoss_d_embedding_weights, // [vocabSize, dim] - correct because in the forward we multiplied by the tranpose of the embedding weights, so the gradient has the transpose shape too.
+	    dLoss_d_embedding_weights, // [dim, vocabSize]
 	    CUDA_R_32F,
-	    vocabSize, // ldc, mem col size
+	    dim, // ldc, mem col size
 	    CUBLAS_COMPUTE_32F,
 	    CUBLAS_GEMM_DEFAULT             
 	);
@@ -907,7 +907,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 			backpropCalculations[tIndex].RMS1_sigma_scale_x_upGrad_byCol_RMS, 
 			backpropCalculations[tIndex].RMS1_oneOverR_byCol_RMS, 
 			backpropCalculations[tIndex].RMS1_oneOverColDimR3_byCol_RMS, 
-			(tIndex === (transformers - 1) ?
+			(tIndex == (transformers - 1) ?
 				x_DEVICE :
 				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
 			),
@@ -919,11 +919,11 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		xTotalThreads = dim * L;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
-			(tIndex === (transformers - 1) ?
+			(tIndex == (transformers - 1) ?
 				x_DEVICE_grad :
 				backpropCalculations[tIndex + 1].ffnPlusResidual
 			),
-			(tIndex === (transformers - 1) ?
+			(tIndex == (transformers - 1) ?
 				x_DEVICE :
 				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
 			),
@@ -947,12 +947,14 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		xTotalThreads = dim * L;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		add_residual_path_upGrad_to_x_gradient<<<numBlocks, threadsPerBlock>>>(
-			(tIndex === (transformers - 1) ?
-				x_DEVICE :
-				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
+			(tIndex == (transformers - 1) ?
+				x_DEVICE_grad :
+				backpropCalculations[tIndex + 1].ffnPlusResidual
 			),
 			backpropCalculations[tIndex].outputProjPlusResidual,
 			dim, L
 		);
 	}
+
+	// add x_DEVICE_grad to embedding_weights
 }
