@@ -49,7 +49,7 @@ __global__ void preCalcRMSColWideVals(
 
     float x_sum_currentCol = x_sumByCol_RMS[index];
     oneOverR_byCol_RMS[index] = 1.0f / x_sum_currentCol;
-    oneOverColDimR3_byCol_RMS[index] = 1.0f / (colDim * x_sum_currentCol * x_sum_currentCol * x_sum_currentCol);
+    oneOverColDimR3_byCol_RMS[index] = 1.0f / ((float)colDim * x_sum_currentCol * x_sum_currentCol * x_sum_currentCol);
 
     int x_preRMS_coloffset = colDim * index;
     sigma_scale_x_upGrad_byCol_RMS[index] = 0;
@@ -182,6 +182,61 @@ __global__ void dLoss_d_pre_softmax_pre_div_by_sqrt_head_dim(float* preSoftmax_p
     preSoftmax_preDivSqrtHeadDim_grad[index] = invSqrtHeadDim * (attnByHead_postSoftmax[index] * attnByHead_postSoftmax_upGrad[index] - attnByHead_postSoftmax[index] * softmaxGradSumByCol[globalColIndex]);
 }
 
+// run only once
+__global__ void preCalcRopeTheta(float* ropeThetaStore, int ropeBase, int dimPairs_, int headDim_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = dimPairs_ * L_;
+    if (index >= max) {
+    	return;
+    }
+
+    int colIndex = index / dimPairs_;
+    int pairIndex = index - colIndex * dimPairs_;
+    int pairsPerHead = headDim_ / 2;
+    int headIndex = pairIndex / pairsPerHead;    
+    int headRelativePairIndex = pairIndex - headIndex * pairsPerHead;
+
+    float wi = powf((float)ropeBase, (-2.0f * (float)headRelativePairIndex / (float)headDim_));
+    ropeThetaStore[index * 2] = cosf((float)colIndex * wi);
+    ropeThetaStore[index * 2 + 1] = sinf((float)colIndex * wi);
+}
+
+__global__ void dLoss_d_pre_rope(float* preRoPE_grad, float* ropeThetaStore, float* postRoPE_upGrad, int dimPairs_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = dimPairs_ * L_;
+    if (index >= max) {
+    	return;
+    }
+
+    float cosTheta = ropeThetaStore[index * 2];
+    float sinTheta = ropeThetaStore[index * 2 + 1];
+
+    float evenOfPairUpGrad = postRoPE_upGrad[index * 2];
+    float oddOfPairUpGrad = postRoPE_upGrad[index * 2 + 1];
+
+    // column major, [attnHeads * pairsPerHead * 2, L] : [dim, L], index: 0 to attnHeads * pairsPerHead * L
+    preRoPE_grad[index * 2] = evenOfPairUpGrad * cosTheta + oddOfPairUpGrad * sinTheta;
+    preRoPE_grad[index * 2 + 1] = -evenOfPairUpGrad * sinTheta + oddOfPairUpGrad * cosTheta;
+}
+
+__global__ void add_residual_path_upGrad_to_x_gradient(float* x_grad, float* outputProjPlusResidual_upGrad, int dim_, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = dim_ * L_;
+    if (index >= max) {
+    	return;
+    }
+
+    x_grad[index] += outputProjPlusResidual_upGrad[index];
+}
+
+void setuRopeThetaStore() {
+	int xTotalThreads = dim / 2 * L;
+    int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;	
+	preCalcRopeTheta<<<numBlocks, threadsPerBlock>>>(
+		ropeThetaStore_DEVICE, ropeDenomBase, headDim / 2, headDim, L
+	);
+}
+
 void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	int xTotalThreads = vocabSize * L;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
@@ -229,6 +284,9 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	// i.e. changing A[3][5] updates the 3th row of the result by the 5th row of B
 	// (dLoss/dVocabScores)[3rd row] @ ffn_postRMS_DEVICE.T[5th col - has been been 5th row] of the result
 	// changing A[3][5] --> found in [3, 5] of backprop matrix
+
+	// dL/d(A.t) = dL/dC * dC / d(A.t) = G * B.t,
+	// dL/dA = dL/dC * dC / d(A) = B * G.t
 	cublasGemmEx(
 	    handle,
 	    CUBLAS_OP_N,
@@ -288,324 +346,613 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		L
 	);	
 
-	// (dLoss/d_ffn_final) * (d_ffn_final/d_ffn_right_postHadamard)
-	// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
-	// transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard: [ffnDim, L],
-	// transformerCalculations_DEVICE[tIndex].ffn_final [dim L],
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_T,
-	    CUBLAS_OP_N,
-	    ffnDim, // rows C
-	    L, // cols C
-	    dim, // contracting (shared) dim
-	    &alpha,
-	    transformerWeights_DEVICE[0].ffn_left_weights,
-	    CUDA_R_32F,
-	    dim, // lda, mem col size for col-major
-	    backpropCalculations[0].ffn_final_plus_residual, // implicit dLoss/d_ffn_final_plus_residual
-	    CUDA_R_32F,
-	    dim, // ldb, mem col size for col-major      
-	    &beta,
-	    backpropCalculations[0].ffn_right_postHadamard, // implicit dLoss/d_ffn_right_postHadamard
-	    CUDA_R_32F,
-	    ffnDim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+	for (int tIndex = 0; tIndex < transformers; tIndex++) {
+		// (dLoss/d_ffn_final) * (d_ffn_final/d_ffn_right_postHadamard)
+		// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
+		// transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard: [ffnDim, L],
+		// transformerCalculations_DEVICE[tIndex].ffn_final [dim L],
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    ffnDim, // rows C
+		    L, // cols C
+		    dim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].ffn_left_weights,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].ffn_final_plus_residual, // implicit dLoss/d_ffn_final_plus_residual
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major      
+		    &beta,
+		    backpropCalculations[tIndex].ffn_right_postHadamard, // implicit dLoss/d_ffn_right_postHadamard
+		    CUDA_R_32F,
+		    ffnDim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	// (dLoss/d_ffn_final) * (d_ffn_final/ffn_left_weights)
-	// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
-	// transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard: [ffnDim, L],
-	// transformerCalculations_DEVICE[tIndex].ffn_final [dim, L],
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_N,
-	    CUBLAS_OP_T,
-	    dim, // rows C
-	    ffnDim, // cols C
-	    L, // contracting (shared) dim
-	    &alpha,
-	    backpropCalculations[0].ffn_final_plus_residual,
-	    CUDA_R_32F,
-	    dim, // lda, mem col size for col-major
-	    transformerCalculations_DEVICE[0].ffn_right_postHadamard,
-	    CUDA_R_32F,
-	    ffnDim, // ldb, mem col size for col-major      
-	    &beta,
-	    backpropCalculations[0].ffn_left_weights,
-	    CUDA_R_32F,
-	    dim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// (dLoss/d_ffn_final) * (d_ffn_final/ffn_left_weights)
+		// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
+		// transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard: [ffnDim, L],
+		// transformerCalculations_DEVICE[tIndex].ffn_final [dim, L],
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    dim, // rows C
+		    ffnDim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].ffn_final_plus_residual,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard,
+		    CUDA_R_32F,
+		    ffnDim, // ldb, mem col size for col-major      
+		    &beta,
+		    backpropCalculations[tIndex].ffn_left_weights,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	xTotalThreads = ffnDim * L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	dLoss_d_ffn_right_pre_hadamard_backprop<<<numBlocks, threadsPerBlock>>>(
-		backpropCalculations[0].ffn_right_1_postSilu, 
-		backpropCalculations[0].ffn_right_2, 
-		transformerCalculations_DEVICE[0].ffn_right_1_postSilu, 
-		transformerCalculations_DEVICE[0].ffn_right_2, 
-		backpropCalculations[0].ffn_right_postHadamard, 
-		ffnDim, 
-		L
-	);
+		xTotalThreads = ffnDim * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_d_ffn_right_pre_hadamard_backprop<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].ffn_right_1_postSilu, 
+			backpropCalculations[tIndex].ffn_right_2, 
+			transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, 
+			transformerCalculations_DEVICE[tIndex].ffn_right_2, 
+			backpropCalculations[tIndex].ffn_right_postHadamard, 
+			ffnDim, 
+			L
+		);
 
-	xTotalThreads = ffnDim * L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	dLoss_d_ffn_right_1_preSilu<<<numBlocks, threadsPerBlock>>>(
-		backpropCalculations[0].ffn_right_1_preSilu,
-		transformerCalculations_DEVICE[0].ffn_right_1_postSilu, 
-		transformerCalculations_DEVICE[0].ffn_right_1_preSilu,
-		backpropCalculations[0].ffn_right_1_postSilu, 
-		ffnDim,
-		L
-	);
+		xTotalThreads = ffnDim * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_d_ffn_right_1_preSilu<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].ffn_right_1_preSilu,
+			transformerCalculations_DEVICE[tIndex].ffn_right_1_postSilu, 
+			transformerCalculations_DEVICE[tIndex].ffn_right_1_preSilu,
+			backpropCalculations[tIndex].ffn_right_1_postSilu, 
+			ffnDim,
+			L
+		);
 
-	// dL/dB = A.t @ G, dL/dA = G @ B.t
+		// dL/dB = A.t @ G, dL/dA = G @ B.t
 
-	// dL/dB = A.t @ G
-	// (dLoss / d_ffn_right_1_preSilu) * (d_ffn_right_1_preSilu / d_ffn_right_1_x)
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_T,
-	    CUBLAS_OP_N,
-	    dim, // rows C
-	    L, // cols C
-	    ffnDim, // contracting (shared) dim
-	    &alpha,
-	    transformerWeights_DEVICE[0].ffn_right_1_weights,
-	    CUDA_R_32F,
-	    ffnDim, // lda, mem col size for col-major
-	    backpropCalculations[0].ffn_right_1_preSilu,
-	    CUDA_R_32F,
-	    ffnDim, // ldb, mem col size for col-major      
-	    &beta,
-	    backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
-	    CUDA_R_32F,
-	    dim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// dL/dB = A.t @ G
+		// (dLoss / d_ffn_right_1_preSilu) * (d_ffn_right_1_preSilu / d_ffn_right_1_x)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    dim, // rows C
+		    L, // cols C
+		    ffnDim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].ffn_right_1_weights,
+		    CUDA_R_32F,
+		    ffnDim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].ffn_right_1_preSilu,
+		    CUDA_R_32F,
+		    ffnDim, // ldb, mem col size for col-major      
+		    &beta,
+		    backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	// dL/dA = G [ffnDim, L] @ B.t [L, dim]
-	// (dLoss / d_ffn_right_1_preSilu) * (d_ffn_right_1_preSilu / d_ffn_right_1_weights)
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_N,
-	    CUBLAS_OP_T,
-	    ffnDim, // rows C
-	    dim, // cols C
-	    L, // contracting (shared) dim
-	    &alpha,
-	    backpropCalculations[0].ffn_right_1_preSilu,
-	    CUDA_R_32F,
-	    ffnDim, // lda, mem col size for col-major
-	    transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2_post_gamma,
-	    CUDA_R_32F,
-	    dim, // ldb, mem col size for col-major      
-	    &beta,
-	    backpropCalculations[0].ffn_right_1_weights,
-	    CUDA_R_32F,
-	    ffnDim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// dL/dA = G [ffnDim, L] @ B.t [L, dim]
+		// (dLoss / d_ffn_right_1_preSilu) * (d_ffn_right_1_preSilu / d_ffn_right_1_weights)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    ffnDim, // rows C
+		    dim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].ffn_right_1_preSilu,
+		    CUDA_R_32F,
+		    ffnDim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major      
+		    &beta,
+		    backpropCalculations[tIndex].ffn_right_1_weights,
+		    CUDA_R_32F,
+		    ffnDim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	float beta_one = 1.0;
-	// dL/dB [dim, L] = A.t [dim, ffnDim] @ G [ffnDim, L]
-	// (dLoss / d_ffn_right_2) * (d_ffn_right_2 / d_ffn_right_2_x)
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_T,
-	    CUBLAS_OP_N,
-	    dim, // rows C
-	    L, // cols C
-	    ffnDim, // contracting (shared) dim
-	    &alpha,
-	    transformerWeights_DEVICE[0].ffn_right_2_weights,
-	    CUDA_R_32F,
-	    ffnDim, // lda, mem col size for col-major
-	    backpropCalculations[0].ffn_right_2,
-	    CUDA_R_32F,
-	    ffnDim, // ldb, mem col size for col-major      
-	    &beta_one,
-	    backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
-	    CUDA_R_32F,
-	    dim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// dL/dB [dim, L] = A.t [dim, ffnDim] @ G [ffnDim, L]
+		// (dLoss / d_ffn_right_2) * (d_ffn_right_2 / d_ffn_right_2_x)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    dim, // rows C
+		    L, // cols C
+		    ffnDim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].ffn_right_2_weights,
+		    CUDA_R_32F,
+		    ffnDim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].ffn_right_2,
+		    CUDA_R_32F,
+		    ffnDim, // ldb, mem col size for col-major      
+		    &beta_one,
+		    backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	// dL/dA = G [ffnDim, L] @ B.t [L, dim]
-	// (dLoss / d_ffn_right_2) * (d_ffn_right_2 / d_ffn_right_2_weights)
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_N,
-	    CUBLAS_OP_T,
-	    ffnDim, // rows C
-	    dim, // cols C
-	    L, // contracting (shared) dim
-	    &alpha,
-	    backpropCalculations[0].ffn_right_2,
-	    CUDA_R_32F,
-	    ffnDim, // lda, mem col size for col-major
-	    transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2_post_gamma,
-	    CUDA_R_32F,
-	    dim, // ldb, mem col size for col-major      
-	    &beta,
-	    backpropCalculations[0].ffn_right_2_weights,
-	    CUDA_R_32F,
-	    ffnDim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// dL/dA = G [ffnDim, L] @ B.t [L, dim]
+		// (dLoss / d_ffn_right_2) * (d_ffn_right_2 / d_ffn_right_2_weights)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    ffnDim, // rows C
+		    dim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].ffn_right_2,
+		    CUDA_R_32F,
+		    ffnDim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major      
+		    &beta,
+		    backpropCalculations[tIndex].ffn_right_2_weights,
+		    CUDA_R_32F,
+		    ffnDim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	xTotalThreads = L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
-		backpropCalculations[0].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
-		backpropCalculations[0].RMS2_oneOverR_byCol_RMS, 
-		backpropCalculations[0].RMS2_oneOverColDimR3_byCol_RMS, 
-		transformerCalculations_DEVICE[0].outputProjPlusResidual, 
-		transformerCalculations_DEVICE[0].outputProjPlusResidual_sumByCol_RMS2,
-		transformerWeights_DEVICE[0].rms2_weights, 
-		backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma, 
-		dim, L
-	);
-	xTotalThreads = dim * L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
-		backpropCalculations[0].outputProjPlusResidual,
-		transformerCalculations_DEVICE[0].outputProjPlusResidual,
-		backpropCalculations[0].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
-		backpropCalculations[0].RMS2_oneOverR_byCol_RMS, 
-		backpropCalculations[0].RMS2_oneOverColDimR3_byCol_RMS, 
-		transformerWeights_DEVICE[0].rms2_weights, 
-		backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
-		dim, L
-	);
-	xTotalThreads = dim;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
-		backpropCalculations[0].RMS2_gamma_weights,
-		transformerCalculations_DEVICE[0].outputProjPlusResidual_postRMS2_pre_gamma,
-		rightEndIndex,
-		backpropCalculations[0].outputProjPlusResidual_postRMS2_post_gamma,
-		dim, L
-	);
+		xTotalThreads = L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].RMS2_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].RMS2_oneOverColDimR3_byCol_RMS, 
+			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, 
+			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2,
+			transformerWeights_DEVICE[tIndex].rms2_weights, 
+			backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma, 
+			dim, L
+		);
+		xTotalThreads = dim * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].outputProjPlusResidual,
+			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual,
+			backpropCalculations[tIndex].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].RMS2_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].RMS2_oneOverColDimR3_byCol_RMS, 
+			transformerWeights_DEVICE[tIndex].rms2_weights, 
+			backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+			dim, L
+		);
+		xTotalThreads = dim;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].RMS2_gamma_weights,
+			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_pre_gamma,
+			rightEndIndex,
+			backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
+			dim, L
+		);
 
-	xTotalThreads = dim * L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	dLoss_d_output_projection_residual_path<<<numBlocks, threadsPerBlock>>>(
-		backpropCalculations[0].outputProjPlusResidual, 
-		backpropCalculations[0].ffn_final_plus_residual, 
-		dim, L
-	);
+		xTotalThreads = dim * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_d_output_projection_residual_path<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].outputProjPlusResidual, 
+			backpropCalculations[tIndex].ffn_final_plus_residual, 
+			dim, L
+		);
 
-	// dL/dB = A.t [dim, dim] @ G [dim, L]
-	// (dLoss / d_outputProjPlusResidual) / (d_outputProjPlusResidual / d_valueScaledSoftmaxAttn)
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_T,
-	    CUBLAS_OP_N,
-	    dim, // rows C
-	    L, // cols C
-	    dim, // contracting (shared) dim
-	    &alpha,
-	    transformerWeights_DEVICE[0].output_proj_weights,
-	    CUDA_R_32F,
-	    dim, // lda, mem col size for col-major
-	    backpropCalculations[0].outputProjPlusResidual,
-	    CUDA_R_32F,
-	    dim, // ldb, mem col size for col-major
-	    &beta,
-	    backpropCalculations[0].valueScaledSoftmaxAttn,
-	    CUDA_R_32F,
-	    dim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// dL/dB = A.t [dim, dim] @ G [dim, L]
+		// (dLoss / d_outputProjPlusResidual) / (d_outputProjPlusResidual / d_valueScaledSoftmaxAttn)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    dim, // rows C
+		    L, // cols C
+		    dim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].output_proj_weights,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].outputProjPlusResidual,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta,
+		    backpropCalculations[tIndex].valueScaledSoftmaxAttn,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
-	// (dLoss / d_outputProjPlusResidual) / (d_outputProjPlusResidual / d_output_proj_weights)
-	cublasGemmEx(
-	    handle,
-	    CUBLAS_OP_N,
-	    CUBLAS_OP_T,
-	    dim, // rows C
-	    dim, // cols C
-	    L, // contracting (shared) dim
-	    &alpha,
-	    backpropCalculations[0].outputProjPlusResidual,
-	    CUDA_R_32F,
-	    dim, // lda, mem col size for col-major
-	    transformerCalculations_DEVICE[0].valueScaledSoftmaxAttn,
-	    CUDA_R_32F,
-	    dim, // ldb, mem col size for col-major
-	    &beta,
-	    backpropCalculations[0].output_proj_weights,
-	    CUDA_R_32F,
-	    dim, // ldc, mem col size
-	    CUBLAS_COMPUTE_32F,
-	    CUBLAS_GEMM_DEFAULT             
-	);
+		// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
+		// (dLoss / d_outputProjPlusResidual) / (d_outputProjPlusResidual / d_output_proj_weights)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    dim, // rows C
+		    dim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].outputProjPlusResidual,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta,
+		    backpropCalculations[tIndex].output_proj_weights,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
 
-	// dL/dA [dim, L] = G [dim, L] @ B.t [L, L]
-	// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_values)	
-    cublasGemmStridedBatchedEx(
-        handle,
-        CUBLAS_OP_N,
-        CUBLAS_OP_T,
-        headDim, // rows C 
-        L, // cols C
-        L, // contracting (shared) dim
-        &alpha,
-        backpropCalculations[0].valueScaledSoftmaxAttn,
-        CUDA_R_32F,
-        dim, // lda, mem col size
-        headDim, // mem stride to reach next head
-        transformerCalculations_DEVICE[0].attnByHead_postSoftmax,
-        CUDA_R_32F,
-        L, // ldb, col size in mem for col-major
-        (L * L), // mem stride to reach next head
-        &beta,
-        backpropCalculations[0].values,
-        CUDA_R_32F,
-        dim, // ldc, col size in mem
-        headDim, // mem stride to reach next head
-        attnHeads,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT
-    );
+		// dL/dA [dim, L] = G [dim, L] @ B.t [L, L]
+		// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_values)	
+	    cublasGemmStridedBatchedEx(
+	        handle,
+	        CUBLAS_OP_N,
+	        CUBLAS_OP_T,
+	        headDim, // rows C 
+	        L, // cols C
+	        L, // contracting (shared) dim
+	        &alpha,
+	        backpropCalculations[tIndex].valueScaledSoftmaxAttn,
+	        CUDA_R_32F,
+	        dim, // lda, mem col size
+	        headDim, // mem stride to reach next head
+	        transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax,
+	        CUDA_R_32F,
+	        L, // ldb, col size in mem for col-major
+	        (L * L), // mem stride to reach next head
+	        &beta,
+	        backpropCalculations[tIndex].values,
+	        CUDA_R_32F,
+	        dim, // ldc, col size in mem
+	        headDim, // mem stride to reach next head
+	        attnHeads,
+	        CUBLAS_COMPUTE_32F,
+	        CUBLAS_GEMM_DEFAULT
+	    );
 
-    // CRITICAL: must mask to zero where row > col (in a later kernel, together with pre-softmax)
-	// dL/dB [L, L] = A.t [L, headDim] @ G [headDim, L]
-	// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_attnByHead_postSoftmax)	
-    cublasGemmStridedBatchedEx(
-        handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        L, // rows C 
-        L, // cols C
-        headDim, // contracting (shared) dim
-        &alpha,
-        transformerCalculations_DEVICE[0].values,
-        CUDA_R_32F,
-        dim, // lda, mem col size
-        headDim, // mem stride to reach next head
-        backpropCalculations[0].valueScaledSoftmaxAttn,
-        CUDA_R_32F,
-        dim, // ldb, col size in mem for col-major
-        headDim, // mem stride to reach next head
-        &beta,
-        backpropCalculations[0].attnByHead_postSoftmax,
-        CUDA_R_32F,
-        L, // ldc, col size in mem
-        L * L, // mem stride to reach next head
-        attnHeads,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT
-    );
+	    // CRITICAL: must mask to zero where row > col (in a later kernel, together with pre-softmax)
+		// dL/dB [L, L] = A.t [L, headDim] @ G [headDim, L]
+		// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_attnByHead_postSoftmax)	
+	    cublasGemmStridedBatchedEx(
+	        handle,
+	        CUBLAS_OP_T,
+	        CUBLAS_OP_N,
+	        L, // rows C 
+	        L, // cols C
+	        headDim, // contracting (shared) dim
+	        &alpha,
+	        transformerCalculations_DEVICE[tIndex].values,
+	        CUDA_R_32F,
+	        dim, // lda, mem col size
+	        headDim, // mem stride to reach next head
+	        backpropCalculations[tIndex].valueScaledSoftmaxAttn,
+	        CUDA_R_32F,
+	        dim, // ldb, col size in mem for col-major
+	        headDim, // mem stride to reach next head
+	        &beta,
+	        backpropCalculations[tIndex].attnByHead_postSoftmax,
+	        CUDA_R_32F,
+	        L, // ldc, col size in mem
+	        L * L, // mem stride to reach next head
+	        attnHeads,
+	        CUBLAS_COMPUTE_32F,
+	        CUBLAS_GEMM_DEFAULT
+	    );
+
+		xTotalThreads = attnHeads * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	    preCalcSoftmaxGradSumByCol<<<numBlocks, threadsPerBlock>>>(
+	    	backpropCalculations[tIndex].attnSoftmaxGradSumByCol, 
+	    	transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, 
+	    	backpropCalculations[tIndex].attnByHead_postSoftmax, 
+	    	attnHeads, L
+	    );
+		xTotalThreads = attnHeads * L * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_d_pre_softmax_pre_div_by_sqrt_head_dim<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].attnKtQByHead, 
+			transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, 
+			backpropCalculations[tIndex].attnSoftmaxGradSumByCol, 
+			backpropCalculations[tIndex].attnByHead_postSoftmax, 
+			attnHeads, headDim, L
+		);
+
+		// dL/d(K.t) [L, headDim] = G [L, L] @ Q.t [L, headDim]
+		// dL/dK [headDim, L] = Q [headDim, L] * G.t [L, L]
+		// (dLoss / d_attnKtQByHead) / (d_attnKtQByHead / d_K)	
+	    cublasGemmStridedBatchedEx(
+	        handle,
+	        CUBLAS_OP_N,
+	        CUBLAS_OP_T,
+	        headDim, // rows C 
+	        L, // cols C
+	        L, // contracting (shared) dim
+	        &alpha,
+	        transformerCalculations_DEVICE[tIndex].queriesPostRoPE,
+	        CUDA_R_32F,
+	        dim, // lda, mem col size
+	        headDim, // mem stride to reach next head
+	        backpropCalculations[tIndex].attnKtQByHead,
+	        CUDA_R_32F,
+	        L, // ldb, col size in mem for col-major
+	        (L * L), // mem stride to reach next head
+	        &beta,
+	        backpropCalculations[tIndex].keysPostRoPE,
+	        CUDA_R_32F,
+	        dim, // ldc, col size in mem
+	        headDim, // mem stride to reach next head
+	        attnHeads,
+	        CUBLAS_COMPUTE_32F,
+	        CUBLAS_GEMM_DEFAULT
+	    );
+
+	    // dL/dQ [headDim, L] = (K.t).t [headDim, L] @ G [L, L] 
+		// (dLoss / d_attnKtQByHead) / (d_attnKtQByHead / d_Q)	
+	    cublasGemmStridedBatchedEx(
+	        handle,
+	        CUBLAS_OP_N,
+	        CUBLAS_OP_N,
+	        headDim, // rows C 
+	        L, // cols C
+	        L, // contracting (shared) dim
+	        &alpha,
+	        transformerCalculations_DEVICE[tIndex].keysPostRoPE,
+	        CUDA_R_32F,
+	        dim, // lda, mem col size
+	        headDim, // mem stride to reach next head
+	        backpropCalculations[tIndex].attnKtQByHead,
+	        CUDA_R_32F,
+	        L, // ldb, col size in mem for col-major
+	        (L * L), // mem stride to reach next head
+	        &beta,
+	        backpropCalculations[tIndex].queriesPostRoPE,
+	        CUDA_R_32F,
+	        dim, // ldc, col size in mem
+	        headDim, // mem stride to reach next head
+	        attnHeads,
+	        CUBLAS_COMPUTE_32F,
+	        CUBLAS_GEMM_DEFAULT
+	    );
+
+		xTotalThreads = dimPairs * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
+	    	backpropCalculations[tIndex].keysPreRoPE, 
+	    	ropeThetaStore_DEVICE, 
+	    	backpropCalculations[tIndex].keysPostRoPE, 
+	    	dimPairs, 
+	    	L
+	    );
+	    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
+	    	backpropCalculations[tIndex].queriesPreRoPE, 
+	    	ropeThetaStore_DEVICE, 
+	    	backpropCalculations[tIndex].queriesPostRoPE, 
+	    	dimPairs, 
+	    	L
+	    );
+
+	    // CHECKED
+
+		// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
+		// (dLoss / d_values) / (d_values / d_value_weights)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    dim, // rows C
+		    dim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].values,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta,
+		    backpropCalculations[tIndex].value_weights,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
+		// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
+		// (dLoss / d_keysPreRoPE) / (d_keysPreRoPE / d_key_weights)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    dim, // rows C
+		    dim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].keysPreRoPE,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta,
+		    backpropCalculations[tIndex].key_weights,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
+		// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
+		// (dLoss / d_queriesPreRoPE) / (d_queriesPreRoPE / d_queries_weights)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_N,
+		    CUBLAS_OP_T,
+		    dim, // rows C
+		    dim, // cols C
+		    L, // contracting (shared) dim
+		    &alpha,
+		    backpropCalculations[tIndex].queriesPreRoPE,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta,
+		    backpropCalculations[tIndex].query_weights,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
+
+		// dL/dB [dim, L] = A.t [dim, dim] @ G [dim, L]
+		// (dLoss / d_values) / (d_values / d_x)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    dim, // rows C
+		    L, // cols C
+		    dim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].value_weights,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].values,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta,
+		    backpropCalculations[tIndex].x_postRMS1_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
+		// dL/dB [dim, L] = A.t [dim, dim] @ G [dim, L]
+		// (dLoss / d_keysPreRoPE) / (d_keysPreRoPE / d_x)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    dim, // rows C
+		    L, // cols C
+		    dim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].key_weights,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].keysPreRoPE,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta_one,
+		    backpropCalculations[tIndex].x_postRMS1_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
+		// dL/dB [dim, L] = A.t [dim, dim] @ G [dim, L]
+		// (dLoss / d_queriesPreRoPE) / (d_queriesPreRoPE / d_x)
+		cublasGemmEx(
+		    handle,
+		    CUBLAS_OP_T,
+		    CUBLAS_OP_N,
+		    dim, // rows C
+		    L, // cols C
+		    dim, // contracting (shared) dim
+		    &alpha,
+		    transformerWeights_DEVICE[tIndex].query_weights,
+		    CUDA_R_32F,
+		    dim, // lda, mem col size for col-major
+		    backpropCalculations[tIndex].queriesPreRoPE,
+		    CUDA_R_32F,
+		    dim, // ldb, mem col size for col-major
+		    &beta_one,
+		    backpropCalculations[tIndex].x_postRMS1_post_gamma,
+		    CUDA_R_32F,
+		    dim, // ldc, mem col size
+		    CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT             
+		);
+
+		xTotalThreads = L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].RMS1_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].RMS1_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].RMS1_oneOverColDimR3_byCol_RMS, 
+			(tIndex === (transformers - 1) ?
+				x_DEVICE :
+				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
+			),
+			transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1,
+			transformerWeights_DEVICE[tIndex].rms1_weights, 
+			backpropCalculations[tIndex].x_postRMS1_post_gamma, 
+			dim, L
+		);
+		xTotalThreads = dim * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
+			(tIndex === (transformers - 1) ?
+				x_DEVICE_grad :
+				backpropCalculations[tIndex + 1].ffnPlusResidual
+			),
+			(tIndex === (transformers - 1) ?
+				x_DEVICE :
+				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
+			),
+			backpropCalculations[tIndex].RMS1_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].RMS1_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].RMS1_oneOverColDimR3_byCol_RMS, 
+			transformerWeights_DEVICE[tIndex].rms1_weights, 
+			backpropCalculations[tIndex].x_postRMS1_post_gamma,
+			dim, L
+		);
+		xTotalThreads = dim;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
+			backpropCalculations[tIndex].RMS1_gamma_weights,
+			transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma,
+			rightEndIndex,
+			backpropCalculations[tIndex].x_postRMS1_post_gamma,
+			dim, L
+		);
+
+		xTotalThreads = dim * L;
+	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		add_residual_path_upGrad_to_x_gradient<<<numBlocks, threadsPerBlock>>>(
+			(tIndex === (transformers - 1) ?
+				x_DEVICE :
+				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
+			),
+			backpropCalculations[tIndex].outputProjPlusResidual,
+			dim, L
+		);
+	}
 }
