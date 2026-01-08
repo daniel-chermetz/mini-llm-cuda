@@ -229,6 +229,21 @@ __global__ void add_residual_path_upGrad_to_x_gradient(float* x_grad, float* out
     x_grad[index] += outputProjPlusResidual_upGrad[index];
 }
 
+__global__ void add_x_grad_to_embeddings_grad(float* embedding_weights_grad, float* x_grad, int* seqTokenIndicesInFullEmbeddings, int dim_, int vocabSize_, int L_, int rightEndIndex) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int max = dim_ * (rightEndIndex + 1);
+    if (index >= max) {
+    	return;
+    }
+
+    int seqTokenIndex = index / dim_;
+    int featureIndex = index - seqTokenIndex * dim_;
+    int embeddingIndex = seqTokenIndicesInFullEmbeddings[seqTokenIndex];
+
+    // OLD: embedding_weights_grad[embeddingIndex * dim_ + featureIndex] += x_grad[leftOffset + index];
+    atomicAdd(&embedding_weights_grad[embeddingIndex * dim_ + featureIndex], x_grad[index]);
+}
+
 void setuRopeThetaStore() {
 	int xTotalThreads = dim / 2 * L;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;	
@@ -957,4 +972,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	}
 
 	// add x_DEVICE_grad to embedding_weights
+	xTotalThreads = dim * (rightEndIndex + 1);
+	numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	add_x_grad_to_embeddings_grad<<<numBlocks, threadsPerBlock>>>(dLoss_d_embedding_weights, x_DEVICE_grad, seqTokenIndices_DEVICE, dim, vocabSize, L, rightEndIndex);
 }
