@@ -576,7 +576,7 @@ int runInference() {
         embedding_weights_DEVICE,
         CUDA_R_32F,
         dim, // lda, col size in mem for col-major
-        ffn_postRMS_DEVICE,
+        ffn_postRMS_post_gamma_DEVICE,
         CUDA_R_32F,
         dim, // ldb, col size in mem for col-major
         &beta,

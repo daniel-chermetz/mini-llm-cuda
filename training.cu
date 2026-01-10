@@ -88,12 +88,12 @@ __global__ void dLoss_dPreRMSNorm(
 }
 
 __global__ void dLoss_d_RMS_gamma_weights(
-	x_postRMS_pre_gamma_grad,
-	x_postRMS_pre_gamma,
-	rightEndIndex,
-	upstream_grad,
-	colDim,
-	L_
+	float* x_postRMS_pre_gamma_grad,
+	float* x_postRMS_pre_gamma,
+	int rightEndIndex,
+	float* upstream_grad,
+	int colDim,
+	int L_
 ) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	if (index >= colDim) {
@@ -229,7 +229,7 @@ __global__ void add_residual_path_upGrad_to_x_gradient(float* x_grad, float* out
     x_grad[index] += outputProjPlusResidual_upGrad[index];
 }
 
-__global__ void add_x_grad_to_embeddings_grad(float* embedding_weights_grad, float* x_grad, int* seqTokenIndicesInFullEmbeddings, int dim_, int vocabSize_, int L_, int rightEndIndex) {
+__global__ void add_x_grad_to_embeddings_grad(float* embedding_weights_grad, float* x_grad, int* seqTokenIndicesInFullEmbeddings, int dim_, int vocabSize_, int rightEndIndex) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int max = dim_ * (rightEndIndex + 1);
     if (index >= max) {
@@ -538,9 +538,9 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		xTotalThreads = L;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
-			backpropCalculations[tIndex].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
-			backpropCalculations[tIndex].RMS2_oneOverR_byCol_RMS, 
-			backpropCalculations[tIndex].RMS2_oneOverColDimR3_byCol_RMS, 
+			backpropCalculations[tIndex].rms2_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].rms2_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].rms2_oneOverColDimR3_byCol_RMS, 
 			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, 
 			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2,
 			transformerWeights_DEVICE[tIndex].rms2_weights, 
@@ -552,9 +552,9 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
 			backpropCalculations[tIndex].outputProjPlusResidual,
 			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual,
-			backpropCalculations[tIndex].RMS2_sigma_scale_x_upGrad_byCol_RMS, 
-			backpropCalculations[tIndex].RMS2_oneOverR_byCol_RMS, 
-			backpropCalculations[tIndex].RMS2_oneOverColDimR3_byCol_RMS, 
+			backpropCalculations[tIndex].rms2_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].rms2_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].rms2_oneOverColDimR3_byCol_RMS, 
 			transformerWeights_DEVICE[tIndex].rms2_weights, 
 			backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
 			dim, L
@@ -562,7 +562,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		xTotalThreads = dim;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
-			backpropCalculations[tIndex].RMS2_gamma_weights,
+			backpropCalculations[tIndex].rms2_gamma_weights,
 			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_pre_gamma,
 			rightEndIndex,
 			backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
@@ -919,9 +919,9 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		xTotalThreads = L;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		preCalcRMSColWideVals<<<numBlocks, threadsPerBlock>>>(
-			backpropCalculations[tIndex].RMS1_sigma_scale_x_upGrad_byCol_RMS, 
-			backpropCalculations[tIndex].RMS1_oneOverR_byCol_RMS, 
-			backpropCalculations[tIndex].RMS1_oneOverColDimR3_byCol_RMS, 
+			backpropCalculations[tIndex].rms1_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].rms1_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].rms1_oneOverColDimR3_byCol_RMS, 
 			(tIndex == (transformers - 1) ?
 				x_DEVICE :
 				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
@@ -936,15 +936,15 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		dLoss_dPreRMSNorm<<<numBlocks, threadsPerBlock>>>(
 			(tIndex == (transformers - 1) ?
 				x_DEVICE_grad :
-				backpropCalculations[tIndex + 1].ffnPlusResidual
+				backpropCalculations[tIndex + 1].ffn_final_plus_residual
 			),
 			(tIndex == (transformers - 1) ?
 				x_DEVICE :
 				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
 			),
-			backpropCalculations[tIndex].RMS1_sigma_scale_x_upGrad_byCol_RMS, 
-			backpropCalculations[tIndex].RMS1_oneOverR_byCol_RMS, 
-			backpropCalculations[tIndex].RMS1_oneOverColDimR3_byCol_RMS, 
+			backpropCalculations[tIndex].rms1_sigma_scale_x_upGrad_byCol_RMS, 
+			backpropCalculations[tIndex].rms1_oneOverR_byCol_RMS, 
+			backpropCalculations[tIndex].rms1_oneOverColDimR3_byCol_RMS, 
 			transformerWeights_DEVICE[tIndex].rms1_weights, 
 			backpropCalculations[tIndex].x_postRMS1_post_gamma,
 			dim, L
@@ -952,7 +952,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		xTotalThreads = dim;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
-			backpropCalculations[tIndex].RMS1_gamma_weights,
+			backpropCalculations[tIndex].rms1_gamma_weights,
 			transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma,
 			rightEndIndex,
 			backpropCalculations[tIndex].x_postRMS1_post_gamma,
@@ -964,7 +964,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 		add_residual_path_upGrad_to_x_gradient<<<numBlocks, threadsPerBlock>>>(
 			(tIndex == (transformers - 1) ?
 				x_DEVICE_grad :
-				backpropCalculations[tIndex + 1].ffnPlusResidual
+				backpropCalculations[tIndex + 1].ffn_final_plus_residual
 			),
 			backpropCalculations[tIndex].outputProjPlusResidual,
 			dim, L
@@ -974,5 +974,5 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	// add x_DEVICE_grad to embedding_weights
 	xTotalThreads = dim * (rightEndIndex + 1);
 	numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	add_x_grad_to_embeddings_grad<<<numBlocks, threadsPerBlock>>>(dLoss_d_embedding_weights, x_DEVICE_grad, seqTokenIndices_DEVICE, dim, vocabSize, L, rightEndIndex);
+	add_x_grad_to_embeddings_grad<<<numBlocks, threadsPerBlock>>>(dLoss_d_embedding_weights, x_DEVICE_grad, seqTokenIndices_DEVICE, dim, vocabSize, rightEndIndex);
 }

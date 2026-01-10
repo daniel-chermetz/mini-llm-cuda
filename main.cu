@@ -180,7 +180,7 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_sumByCol_RMS2, L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_postRMS2_pre_gamma, dim * L * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_postRMS2_post_gammma, dim * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_postRMS2_post_gamma, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_preSilu, ffnDim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_1_postSilu, ffnDim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_2, ffnDim * L * sizeof(float));
@@ -199,6 +199,8 @@ void allocateMemory(bool allocateTraining) {
     cudaMalloc((void**)&vocabScores_postSoftmax_DEVICE, vocabSize * L * sizeof(float));
 
     if (allocateTraining) {
+        cudaMalloc((void**)&ropeThetaStore_DEVICE, dim * L * sizeof(float));
+
         cudaMalloc((void**)&dLoss_d_vocabScores, vocabSize * L * sizeof(float));
         cudaMalloc((void**)&dLoss_d_embedding_weights, dim * vocabSize * sizeof(float));
 
@@ -208,6 +210,8 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&ffn_final_sigma_scale_x_upGrad_byCol_RMS, L * sizeof(float));
         cudaMalloc((void**)&ffn_final_oneOverR_byCol_RMS, L * sizeof(float));
         cudaMalloc((void**)&ffn_final_oneOverColDimR3_byCol_RMS, L * sizeof(float));
+
+        cudaMalloc((void**)&x_DEVICE_grad, dim * L * sizeof(float));
 
         // implicitly these are gradients (without specifying that in the variable name)
         for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
@@ -224,11 +228,11 @@ void allocateMemory(bool allocateTraining) {
             cudaMalloc((void**)&backpropCalculations[transformerIndex].ffn_right_2_weights, ffnDim * dim * sizeof(float));
 
             cudaMalloc((void**)&backpropCalculations[transformerIndex].outputProjPlusResidual_postRMS2_post_gamma, dim * L * sizeof(float));
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].RMS2_gamma_weights, dim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms2_gamma_weights, dim * sizeof(float));
 
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].RMS2_sigma_scale_x_upGrad_byCol_RMS, L * sizeof(float));
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].RMS2_oneOverR_byCol_RMS, L * sizeof(float));
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].RMS2_oneOverColDimR3_byCol_RMS, L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms2_sigma_scale_x_upGrad_byCol_RMS, L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms2_oneOverR_byCol_RMS, L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms2_oneOverColDimR3_byCol_RMS, L * sizeof(float));
             
             cudaMalloc((void**)&backpropCalculations[transformerIndex].outputProjPlusResidual, dim * L * sizeof(float));
 
@@ -236,7 +240,25 @@ void allocateMemory(bool allocateTraining) {
             cudaMalloc((void**)&backpropCalculations[transformerIndex].output_proj_weights, dim * dim * sizeof(float));
 
             cudaMalloc((void**)&backpropCalculations[transformerIndex].values, dim * L * sizeof(float));
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnByHead_postSoftmax, attnHeads * L * L * sizeof(float));            
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnByHead_postSoftmax, attnHeads * L * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnSoftmaxGradSumByCol, attnHeads * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnKtQByHead, attnHeads * L * L * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPostRoPE, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPreRoPE, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPostRoPE, dim * L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPreRoPE, dim * L * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].value_weights, dim * dim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].query_weights, dim * dim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].key_weights, dim * dim * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms1_gamma_weights, dim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms1_sigma_scale_x_upGrad_byCol_RMS, L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms1_oneOverR_byCol_RMS, L * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms1_oneOverColDimR3_byCol_RMS, L * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].x_postRMS1_post_gamma, dim * L * sizeof(float));
         }
     }
 }
@@ -402,7 +424,7 @@ int compareTokenProb(const void* a, const void* b) {
 }
 
 int main(int argc, char* argv[]) {
-    allocateMemory();
+    allocateMemory(true);
     
     const char* modelNameFromArg = (argc > 1) ? argv[1] : "model";
     //char* modelName = "model_10_lr_5e6";

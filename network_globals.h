@@ -41,7 +41,7 @@ typedef struct {
     float* ffn_right_2;
     float* ffn_right_postHadamard;
     float* ffn_final;
-    float* ffnPlusResidual;
+    float* ffnPlusResidual; // should be called ffn_final_plus_residual
 } TransformerCalculations_DEVICE;
 
 // training (implicitly on Device)
@@ -55,8 +55,31 @@ typedef struct {
     float* ffn_right_1_weights;    
     float* ffn_right_2;
     float* ffn_right_2_weights;
-    float* outputProjPlusResidual_postRMS2;
+    float* outputProjPlusResidual_postRMS2_post_gamma;
+    float* outputProjPlusResidual_postRMS2_pre_gamma;
+    float* rms2_gamma_weights;
+    float* rms2_sigma_scale_x_upGrad_byCol_RMS;
+    float* rms2_oneOverR_byCol_RMS;
+    float* rms2_oneOverColDimR3_byCol_RMS;
     float* outputProjPlusResidual;
+    float* output_proj_weights;
+    float* valueScaledSoftmaxAttn;
+    float* attnByHead_postSoftmax;
+    float* attnSoftmaxGradSumByCol;
+    float* values;
+    float* attnKtQByHead;
+    float* keysPostRoPE;
+    float* keysPreRoPE;    
+    float* queriesPostRoPE;
+    float* queriesPreRoPE;
+    float* value_weights;
+    float* key_weights;
+    float* query_weights;
+    float* rms1_gamma_weights;
+    float* rms1_sigma_scale_x_upGrad_byCol_RMS;
+    float* rms1_oneOverR_byCol_RMS;
+    float* rms1_oneOverColDimR3_byCol_RMS;
+    float* x_postRMS1_post_gamma; 
 } BackpropCalculations;
 
 #ifdef __cplusplus
@@ -68,6 +91,7 @@ extern cublasHandle_t handle;
 extern int threadsPerBlock;
 extern float alpha;
 extern float beta;
+extern float beta_one;
 
 extern int* seqTokenIndices;
 extern int* seqTokenIndices_DEVICE;
@@ -102,6 +126,8 @@ extern float* vocabScores_postSoftmax_DEVICE;
 (implicitly on Device)
 */
 
+extern float* ropeThetaStore_DEVICE;
+
 extern float* dLoss_d_vocabScores;
 extern float* dLoss_d_embedding_weights;
 extern float* dLoss_d_ffn_final_postRMS_postGamma;
@@ -110,6 +136,8 @@ extern float* dLoss_d_ffn_final_RMS_gamma_weights;
 extern float* ffn_final_sigma_scale_x_upGrad_byCol_RMS;
 extern float* ffn_final_oneOverR_byCol_RMS;
 extern float* ffn_final_oneOverColDimR3_byCol_RMS;
+
+extern float* x_DEVICE_grad;
 
 extern BackpropCalculations backpropCalculations[transformers];
 
