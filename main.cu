@@ -1,5 +1,5 @@
 /*
-nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu \
+nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
      -o inference \
      -lcublas \
      -arch=sm_86

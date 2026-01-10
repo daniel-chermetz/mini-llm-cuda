@@ -28,7 +28,7 @@ HEAD_DIM = DIM // ATTN_HEADS  # 64
 SCALE = 1.0 / math.sqrt(HEAD_DIM)
 
 # Device configuration
-device = 'cpu'  # Change to 'cuda' if you want to verify float precision on GPU
+device = 'mps'  # Change to 'cuda' if you want to verify float precision on GPU
 
 # ==========================================
 # 1. Load Vocabulary and Sample
