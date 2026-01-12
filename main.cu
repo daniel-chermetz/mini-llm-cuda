@@ -1,5 +1,6 @@
 /*
 nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
+     inference_orchestrator.cu gradient_testing.cu \
      -o inference \
      -lcublas \
      -arch=sm_86
@@ -18,6 +19,9 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu train
 #include "network_globals.h"
 #include "load_model.h"
 #include "inference.h"
+#include "training.h"
+#include "inference_orchestrator.h"
+#include "gradient_testing.h"
 
 void allocateMemory(bool allocateTraining) {
 	cublasCreate(&handle);
@@ -260,6 +264,9 @@ void allocateMemory(bool allocateTraining) {
 
             cudaMalloc((void**)&backpropCalculations[transformerIndex].x_postRMS1_post_gamma, dim * L * sizeof(float));
         }
+
+        // Setup RoPE theta store for training
+        setupRoPEThetaStore();
     }
 }
 
@@ -407,22 +414,6 @@ int loadStoryContext(const char* storiesPath, int storyIndex, int percentage) {
     return contextLength - 1;  // Return rightSeqEndIndex (last real token index)
 }
 
-// ============================================================================
-// TEXT GENERATION WITH TOP-K SAMPLING
-// ============================================================================
-
-// Structure to hold token index and probability for sorting
-typedef struct {
-    int tokenIdx;
-    float prob;
-} TokenProb;
-
-// Comparison function for qsort (descending probability)
-int compareTokenProb(const void* a, const void* b) {
-    float diff = ((TokenProb*)b)->prob - ((TokenProb*)a)->prob;
-    return (diff > 0) ? 1 : (diff < 0 ? -1 : 0);
-}
-
 int main(int argc, char* argv[]) {
     allocateMemory(true);
     
@@ -430,9 +421,9 @@ int main(int argc, char* argv[]) {
     //char* modelName = "model_10_lr_5e6";
     //char* modelName = "model_11_lr_1e5";
     //char* modelName = "model_12_lr_4e6";
-    char* modelName = "model_13_lr_3e6";
+    //char* modelName = "model_13_lr_3e6";
     //char* modelName = "model_14_lr_3e6";
-    //char* modelName = "model_15_lr_3e6";
+    char* modelName = "model_15_lr_3e6";
     if (!loadModel(modelName)) {
         printf("Failed to load model '%s', using random weights.\n", modelName);
     }
@@ -444,174 +435,22 @@ int main(int argc, char* argv[]) {
         printf("Failed to load vocabulary.\n");
     }
     
-    // Load story context
-    // Default: story index 0, 50% of tokens as context
+    // ========================================================================
+    // MODE SELECTION: Comment/uncomment to switch between modes
+    // ========================================================================
+    
+    // --- INFERENCE MODE ---
+    // Run text generation inference loop
+    const char* storiesPath = "./tokenizedStories/tokenizedStories_0001.json";
     int storyIndex = (argc > 2) ? atoi(argv[2]) : 0;
     int contextPercent = (argc > 3) ? atoi(argv[3]) : 100;
+    bool skipUserInput = true;
+    bool verboseOutput = false;
+    // runInferenceLoop(storiesPath, storyIndex, contextPercent, skipUserInput, verboseOutput);
     
-    const char* storiesPath = "./tokenizedStories/tokenizedStories_0001.json";
-    int rightSeqEndIndex = loadStoryContext(storiesPath, storyIndex, contextPercent);
-    if (rightSeqEndIndex < 0) {
-        printf("Failed to load story context.\n");
-        return 1;
-    }
+    // --- GRADIENT TESTING MODE ---
+    // Run gradient verification tests
+    runGradientTests();
     
-    // Check if sequence is already full (L tokens)
-    if (rightSeqEndIndex >= L) {
-        printf("Sequence already contains L=%d tokens. No generation needed.\n", L+1);
-        return 0;
-    }
-    
-    // Allocate host memory for vocabulary scores
-    float* vocabScores_postSoftmax = (float*)malloc(vocabSize * L * sizeof(float));
-    if (!vocabScores_postSoftmax) {
-        printf("Error: Failed to allocate memory for vocabulary scores.\n");
-        return 1;
-    }
-    
-    // Generation loop
-    int tokensGenerated = 0;
-    int maxTokensToGenerate = (L + 1) - (rightSeqEndIndex + 1);  // How many tokens until we hit L total
-    bool skipUserInputBeforeGenerating = true;
-    bool verboseGenerationOutput = false;
-    
-    printf("\n========================================\n");
-    printf("Starting text generation (max %d new tokens)\n", maxTokensToGenerate);
-    printf("Press Enter to generate next token, or 'q' + Enter to quit\n");
-    printf("========================================\n\n");
-    
-    auto start = std::chrono::high_resolution_clock::now();
-
-    while (rightSeqEndIndex <= L - 1) {
-        // Run inference
-        // printf("rightSeqEndIndex: %d\n", rightSeqEndIndex);
-        // printf("seqTokenIndices_DEVICE\n");
-        // printIntMatrixToDebugMain(seqTokenIndices_DEVICE, L, L, 30);
-
-        runInference();
-        
-        // Copy vocabulary scores from device to host
-        cudaMemcpy(vocabScores_postSoftmax, vocabScores_postSoftmax_DEVICE, 
-                   vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
-        //printf("vocabScores_postSoftmax_DEVICE");
-        //printFloatMatrixToDebugMain(vocabScores_postSoftmax_DEVICE, dim * vocabSize, 3, 10);
-        
-        // Calculate offset for the prediction position
-        // vocabScores_postSoftmax is column-major: [vocabSize x L]
-        // For position rightSeqEndIndex, we want column rightSeqEndIndex
-        size_t offset = rightSeqEndIndex * vocabSize;
-        
-        // Create array of token probabilities for sorting
-        TokenProb* tokenProbs = (TokenProb*)malloc(vocabSize * sizeof(TokenProb));
-        for (int i = 0; i < vocabSize; i++) {
-            tokenProbs[i].tokenIdx = i;
-            tokenProbs[i].prob = vocabScores_postSoftmax[offset + i];
-        }
-        
-        // Sort by probability (descending)
-        qsort(tokenProbs, vocabSize, sizeof(TokenProb), compareTokenProb);
-
-        if (verboseGenerationOutput) {        
-            // Display top-10 most probable tokens
-            printf("\n--- Top 10 Most Probable Next Tokens (position %d) ---\n", rightSeqEndIndex + 1);
-            for (int i = 0; i < 10 && i < vocabSize; i++) {
-                const char* tokenStr = vocabGetToken(tokenProbs[i].tokenIdx);
-                if (tokenStr) {
-                    // Escape special characters for display
-                    if (strcmp(tokenStr, "\n") == 0) {
-                        printf("%2d. [\\n]         (idx: %5d, prob: %.6f)\n", 
-                               i + 1, tokenProbs[i].tokenIdx, tokenProbs[i].prob);
-                    } else if (strcmp(tokenStr, "\t") == 0) {
-                        printf("%2d. [\\t]         (idx: %5d, prob: %.6f)\n", 
-                               i + 1, tokenProbs[i].tokenIdx, tokenProbs[i].prob);
-                    } else if (strlen(tokenStr) == 0) {
-                        printf("%2d. [EMPTY]       (idx: %5d, prob: %.6f)\n", 
-                               i + 1, tokenProbs[i].tokenIdx, tokenProbs[i].prob);
-                    } else {
-                        printf("%2d. %-12s (idx: %5d, prob: %.6f)\n", 
-                               i + 1, tokenStr, tokenProbs[i].tokenIdx, tokenProbs[i].prob);
-                    }
-                }
-            }
-            printf("-------------------------------------------------------\n");
-        }
-        
-        // Get the most probable token
-        int nextTokenIdx = tokenProbs[0].tokenIdx;
-        const char* nextToken = vocabGetToken(nextTokenIdx);
-
-        if (verboseGenerationOutput) {        
-            printf("\nMost probable token: ");
-            if (nextToken) {
-                if (strcmp(nextToken, "\n") == 0) {
-                    printf("[\\n]");
-                } else if (strcmp(nextToken, "\t") == 0) {
-                    printf("[\\t]");
-                } else {
-                    printf("%s", nextToken);
-                }
-            }
-            printf(" (index: %d)\n", nextTokenIdx);
-        }
-        
-        free(tokenProbs);
-        
-        if (!skipUserInputBeforeGenerating) {        
-            // Wait for user input
-            printf("\nPress Enter to add this token and continue, or 'q' + Enter to quit: ");
-            fflush(stdout);
-            
-            char input[10];
-            if (fgets(input, sizeof(input), stdin) == NULL) {
-                break;
-            }
-            
-            // Check if user wants to quit
-            if (input[0] == 'q' || input[0] == 'Q') {
-                printf("Generation stopped by user.\n");
-                break;
-            }
-        }
-        
-        // Append the token to the sequence
-        rightSeqEndIndex++;
-        seqTokenIndices[rightSeqEndIndex] = nextTokenIdx;
-        tokensGenerated++;
-        
-        // Update the device memory with the new sequence
-        cudaMemcpy(seqTokenIndices_DEVICE, seqTokenIndices, L * sizeof(int), cudaMemcpyHostToDevice);
-
-        if (verboseGenerationOutput) {        
-            printf("\n[Token added. Total context: %d tokens, generated: %d]\n", 
-                   rightSeqEndIndex + 1, tokensGenerated);
-        }
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    printf("Generation took %f ms", elapsed.count() * 1000);
-    
-    printf("\n========================================\n");
-    printf("Generation complete. Generated %d new tokens.\n", tokensGenerated);
-    printf("Final sequence length: %d tokens\n", rightSeqEndIndex + 1);
-    printf("========================================\n\n");
-    
-    // Display final generated sequence
-    printf("=== Final Generated Sequence ===\n");
-    for (int i = 0; i <= rightSeqEndIndex; i++) {
-        const char* token = vocabGetToken(seqTokenIndices[i]);
-        if (token) {
-            if (strcmp(token, "\n") == 0) {
-                printf("[\\n]");
-            } else if (strcmp(token, "\t") == 0) {
-                printf("[\\t]");
-            } else {
-                printf("%s", token);
-            }
-        }
-    }
-    printf("\n================================\n");
-    
-    free(vocabScores_postSoftmax);
     return 0;
 }

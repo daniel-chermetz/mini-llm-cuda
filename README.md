@@ -1,1 +1,1 @@
-### training.cu and inference.cu were manually human written line-by-line
+### 100% of training.cu, 100% of inference.cu, 100% of optimizer.cu, and the allocateMemory function in main.cu were manually human written line-by-line. The rest of the project is largely or wholly AI written.

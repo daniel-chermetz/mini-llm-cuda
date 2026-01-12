@@ -25,7 +25,7 @@ RIGHT_END_INDEX = 100  # Can be 0 to 254
 GRADIENTS_DIR = "./gradients"
 
 # File paths
-MODEL_PATH = "./model.bin"
+MODEL_PATH = "./model_15_lr_3e6.bin"
 VOCAB_PATH = "./vocab.json"
 SAMPLE_PATH = "./sample.json"
 
@@ -199,17 +199,31 @@ for layer in range(LAYERS - 1, -1, -1):
     scores_pre_scale = torch.matmul(k_rot.transpose(-1, -2), q_rot)
     scores_pre_scale.retain_grad()
     intermediates[layer]['scores_pre_scale'] = scores_pre_scale
-    
+
     scores_post_scale = scores_pre_scale * SCALE
     scores_post_scale.retain_grad()
     intermediates[layer]['scores_post_scale'] = scores_post_scale
 
-    # --- Step F: Causal Masking ---
+    # --- Step F: Causal Masking (Tokens = Columns) ---
+    # We want to mask cases where Key_Index (Row) > Query_Index (Col).
+    # This corresponds to the Lower Triangle.
+    
+    # 1. Create mask for strictly lower triangle (The "Future" in this layout)
+    #    diagonal=-1 ensures the main diagonal (present) is NOT masked.
     mask = torch.tril(torch.ones(L, L, device=device), diagonal=-1).bool()
-    scores_post_scale.masked_fill_(mask, float('-inf'))
+
+    # 2. Apply mask Out-Of-Place (using masked_fill instead of masked_fill_)
+    #    This creates a new node in the graph, keeping gradients clean.
+    scores_masked = scores_post_scale.masked_fill(mask, float('-inf'))
+    
+    # Optional: If you want to debug the masked scores
+    scores_masked.retain_grad() 
+    intermediates[layer]['scores_masked'] = scores_masked
 
     # --- Step G: Softmax ---
-    attn_probs = torch.softmax(scores_post_scale, dim=-2)
+    # We normalize vertically so each Column (Query) sums to 1.
+    attn_probs = torch.softmax(scores_masked, dim=-2)
+    
     attn_probs.retain_grad()
     intermediates[layer]['attn_probs'] = attn_probs
 
