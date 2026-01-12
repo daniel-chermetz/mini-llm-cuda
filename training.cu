@@ -183,7 +183,7 @@ __global__ void dLoss_d_pre_softmax_pre_div_by_sqrt_head_dim(float* preSoftmax_p
 }
 
 // run only once
-__global__ void preCalcRopeTheta(float* ropeThetaStore, int ropeBase, int dimPairs_, int headDim_, int L_) {
+__global__ void preCalcRoPETheta(float* ropeThetaStore, int ropeBase, int dimPairs_, int headDim_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int max = dimPairs_ * L_;
     if (index >= max) {
@@ -244,11 +244,11 @@ __global__ void add_x_grad_to_embeddings_grad(float* embedding_weights_grad, flo
     atomicAdd(&embedding_weights_grad[embeddingIndex * dim_ + featureIndex], x_grad[index]);
 }
 
-void setuRopeThetaStore() {
+void setupRoPEThetaStore() {
 	int xTotalThreads = dim / 2 * L;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;	
-	preCalcRopeTheta<<<numBlocks, threadsPerBlock>>>(
-		ropeThetaStore_DEVICE, ropeDenomBase, headDim / 2, headDim, L
+	preCalcRoPETheta<<<numBlocks, threadsPerBlock>>>(
+		ropeThetaStore_DEVICE, ropeDenomBase, dimPairs, headDim, L
 	);
 }
 
