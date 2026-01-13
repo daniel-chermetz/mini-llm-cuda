@@ -82,6 +82,19 @@ typedef struct {
     float* x_postRMS1_post_gamma; 
 } BackpropCalculations;
 
+// Optimizer state for transformer layers (gradient accumulation, EMA, variance)
+typedef struct {
+    float* ffn_left_weights;
+    float* ffn_right_1_weights;
+    float* ffn_right_2_weights;
+    float* rms2_gamma_weights;
+    float* output_proj_weights;
+    float* value_weights;
+    float* query_weights;
+    float* key_weights;
+    float* rms1_gamma_weights;
+} OptimizerTransformerState;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -140,6 +153,48 @@ extern float* ffn_final_oneOverColDimR3_byCol_RMS;
 extern float* x_DEVICE_grad;
 
 extern BackpropCalculations backpropCalculations[transformers];
+
+/*
+### OPTIMIZER STATE ###
+(implicitly on Device)
+*/
+
+// Gradient accumulation
+extern float* gradientAccumulation_embedding_weights;
+extern float* gradientAccumulation_final_RMS_gamma_weights;
+extern OptimizerTransformerState gradientAccumulation[transformers];
+
+// Fast EMA (first moment)
+extern float* fastEMA_embedding_weights;
+extern float* fastEMA_final_RMS_gamma_weights;
+extern OptimizerTransformerState fastEMA[transformers];
+
+// Slow EMA
+extern float* slowEMA_embedding_weights;
+extern float* slowEMA_final_RMS_gamma_weights;
+extern OptimizerTransformerState slowEMA[transformers];
+
+// Variance (second moment)
+extern float* variance_embedding_weights;
+extern float* variance_final_RMS_gamma_weights;
+extern OptimizerTransformerState variance[transformers];
+
+// Beta power stores for bias correction (precomputed 1 - beta^iteration)
+extern float* beta1_pow_store;
+extern float* beta2_pow_store;
+extern float* beta3_pow_store;
+
+/*
+### TRAINING DATA STORAGE ###
+(on Device - for batch training)
+*/
+
+// Storage for training stories: [MAX_TRAINING_STORIES x (L+1)] tokens
+// Each story has 257 tokens (padded with ~ if shorter)
+extern int* trainingStoryTokens_DEVICE;
+
+// Right end index for each story (0 to L-1, one before last true token)
+extern int* trainingStoryRightEndIndices_DEVICE;
 
 #ifdef __cplusplus
 }

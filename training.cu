@@ -976,3 +976,61 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex) {
 	numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 	add_x_grad_to_embeddings_grad<<<numBlocks, threadsPerBlock>>>(dLoss_d_embedding_weights, x_DEVICE_grad, seqTokenIndices_DEVICE, dim, vocabSize, rightEndIndex);
 }
+
+__global__ void add_step_grads_to_batch_accumulation(float* gradAccumulationTensor, float* stepGradTensor, int size) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) {
+    	return;
+    }
+
+    gradAccumulationTensor[index] += stepGradTensor[index];
+}
+
+void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
+	if (resetGradAccumulation) {
+		cudaMemcpy(gradientAccumulation_embedding_weights, dLoss_d_embedding_weights, dim * vocabSize * sizeof(float), cudaMemcpyDeviceToDevice);
+		cudaMemcpy(gradientAccumulation_final_RMS_gamma_weights, dLoss_d_ffn_final_RMS_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    	for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
+			cudaMemcpy(gradientAccumulation[transformerIndex].ffn_left_weights, backpropCalculations[transformerIndex].ffn_left_weights, dim * ffnDim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].ffn_right_1_weights, backpropCalculations[transformerIndex].ffn_right_1_weights, dim * ffnDim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].ffn_right_2_weights, backpropCalculations[transformerIndex].ffn_right_2_weights, dim * ffnDim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].rms2_gamma_weights, backpropCalculations[transformerIndex].rms2_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+
+			cudaMemcpy(gradientAccumulation[transformerIndex].output_proj_weights, backpropCalculations[transformerIndex].output_proj_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].value_weights, backpropCalculations[transformerIndex].value_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].query_weights, backpropCalculations[transformerIndex].query_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].key_weights, backpropCalculations[transformerIndex].key_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(gradientAccumulation[transformerIndex].rms1_gamma_weights, backpropCalculations[transformerIndex].rms1_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    	}
+	} else {
+		int xTotalThreads = dim * vocabSize;
+		int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;		
+		add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation_embedding_weights, dLoss_d_embedding_weights, dim * vocabSize);
+
+		xTotalThreads = dim;
+		numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;		
+		add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation_final_RMS_gamma_weights, dLoss_d_ffn_final_RMS_gamma_weights, dim);
+
+    	for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
+			xTotalThreads = ffnDim * dim;
+			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;		
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].ffn_left_weights, backpropCalculations[transformerIndex].ffn_left_weights, ffnDim * dim);
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].ffn_right_1_weights, backpropCalculations[transformerIndex].ffn_right_1_weights, ffnDim * dim);
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].ffn_right_2_weights, backpropCalculations[transformerIndex].ffn_right_2_weights, ffnDim * dim);
+
+			xTotalThreads = dim * dim;
+			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].output_proj_weights, backpropCalculations[transformerIndex].output_proj_weights, dim * dim);
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].value_weights, backpropCalculations[transformerIndex].value_weights, dim * dim);
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].query_weights, backpropCalculations[transformerIndex].query_weights, dim * dim);
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].key_weights, backpropCalculations[transformerIndex].key_weights, dim * dim);
+
+			xTotalThreads = dim;
+			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].rms1_gamma_weights, backpropCalculations[transformerIndex].rms1_gamma_weights, dim);
+			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].rms2_gamma_weights, backpropCalculations[transformerIndex].rms2_gamma_weights, dim);
+
+		}		
+	}
+}

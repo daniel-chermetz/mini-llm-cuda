@@ -11,9 +11,9 @@ const PRINT_LIMIT = 0;
 const TEST_CONFIG = {
     finalLogitStage: true,   // Logits, embedding weights, final RMS
     t0: true,                // Transformer 0 - uppermost (near logits)
-    t1: false,                // Transformer 1
-    t2: false,                // Transformer 2
-    t3: false,                // Transformer 3 - entry point (receives tokens)
+    t1: true,                // Transformer 1
+    t2: true,                // Transformer 2
+    t3: true,                // Transformer 3 - entry point (receives tokens)
 };
 
 // Network dimensions (from network_meta.h)

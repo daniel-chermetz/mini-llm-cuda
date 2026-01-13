@@ -55,3 +55,44 @@ float* ffn_final_oneOverColDimR3_byCol_RMS = nullptr;
 BackpropCalculations backpropCalculations[transformers];
 
 float* x_DEVICE_grad = nullptr;
+
+/*
+### OPTIMIZER STATE ###
+(implicitly on Device)
+*/
+
+// Gradient accumulation
+float* gradientAccumulation_embedding_weights = nullptr;
+float* gradientAccumulation_final_RMS_gamma_weights = nullptr;
+OptimizerTransformerState gradientAccumulation[transformers];
+
+// Fast EMA (first moment)
+float* fastEMA_embedding_weights = nullptr;
+float* fastEMA_final_RMS_gamma_weights = nullptr;
+OptimizerTransformerState fastEMA[transformers];
+
+// Slow EMA
+float* slowEMA_embedding_weights = nullptr;
+float* slowEMA_final_RMS_gamma_weights = nullptr;
+OptimizerTransformerState slowEMA[transformers];
+
+// Variance (second moment)
+float* variance_embedding_weights = nullptr;
+float* variance_final_RMS_gamma_weights = nullptr;
+OptimizerTransformerState variance[transformers];
+
+// Beta power stores for bias correction (precomputed 1 - beta^iteration)
+float* beta1_pow_store = nullptr;
+float* beta2_pow_store = nullptr;
+float* beta3_pow_store = nullptr;
+
+/*
+### TRAINING DATA STORAGE ###
+(on Device - for batch training)
+*/
+
+// Storage for training stories: [MAX_TRAINING_STORIES x (L+1)] tokens
+int* trainingStoryTokens_DEVICE = nullptr;
+
+// Right end index for each story
+int* trainingStoryRightEndIndices_DEVICE = nullptr;
