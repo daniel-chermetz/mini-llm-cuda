@@ -19,6 +19,8 @@
 #include "inference.h"
 #include "training.h"
 #include "training_orchestrator.h"
+#include "optimizer.h"
+#include "save_model.h"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -26,6 +28,15 @@
 
 // Base path for tokenized stories
 #define TOKENIZED_STORIES_PATH "./tokenizedStories"
+
+// Printing frequency: print every N batches (set to 1 to print all)
+#define PRINT_EVERY_N_BATCHES 100
+
+// Save frequency: save model every N optimizer iterations (100k = 100000)
+#define SAVE_EVERY_N_ITERATIONS 100000
+
+// Model save path template (iteration number will be inserted)
+#define MODEL_SAVE_PATH "./model/weights_iter_%d.bin"
 
 // ============================================================================
 // MODULE-LEVEL STORAGE
@@ -266,8 +277,9 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
 
 // Process a single sequence: run inference, log predictions, compute gradients
 // storyIndex: index into the loaded stories (0-based)
+// shouldPrint: if true, print token-by-token predictions
 // Returns: sequence loss (average negative log likelihood)
-static float processSequence(int storyIndex) {
+static float processSequence(int storyIndex, bool shouldPrint) {
     // Get the rightEndIndex for this story (from host storage)
     int rightEndIndex = hostRightEndIndices_storage[storyIndex];
     int leftStartIndex = 0;
@@ -294,57 +306,63 @@ static float processSequence(int storyIndex) {
     // Run forward pass (inference)
     runInference();
     
-    // Copy softmax scores back to host for logging
-    // vocabScores_postSoftmax_DEVICE is [vocabSize x L] column-major
-    if (hostVocabSoftmax == nullptr) {
-        hostVocabSoftmax = (float*)malloc(vocabSize * L * sizeof(float));
-    }
-    cudaMemcpy(hostVocabSoftmax, vocabScores_postSoftmax_DEVICE, 
-               vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    // ========================================================================
-    // Log predictions: token[i] --> token[i+1] (probability%)
-    // ========================================================================
-    printf("\n--- Story %d Predictions (rightEndIndex = %d) ---\n", storyIndex, rightEndIndex);
-    
     float totalLoss = 0.0f;
-    int numPredictions = 0;
+    int numPredictions = rightEndIndex + 1;  // Approximate for gradient calc
+    float avgLoss = 0.0f;
     
-    // For each position from 0 to rightEndIndex, we predict the next token
-    for (int pos = 0; pos <= rightEndIndex; pos++) {
-        int currentTokenIdx = seqTokenIndices[pos];
-        int nextTokenIdx = seqTokenIndices[pos + 1];  // Target token
+    // Only print detailed predictions if shouldPrint is true
+    if (shouldPrint) {
+        // Allocate softmax buffer if needed
+        if (hostVocabSoftmax == nullptr) {
+            hostVocabSoftmax = (float*)malloc(vocabSize * L * sizeof(float));
+        }
+        cudaMemcpy(hostVocabSoftmax, vocabScores_postSoftmax_DEVICE, 
+                   vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
         
-        // Skip padding predictions
-        if (nextTokenIdx == PADDING_TOKEN_INDEX) {
-            continue;
+        // ========================================================================
+        // Log predictions: token[i] --> token[i+1] (probability%)
+        // ========================================================================
+        printf("\n--- Story %d Predictions (rightEndIndex = %d) ---\n", storyIndex, rightEndIndex);
+        
+        totalLoss = 0.0f;
+        numPredictions = 0;
+        
+        // For each position from 0 to rightEndIndex, we predict the next token
+        for (int pos = 0; pos <= rightEndIndex; pos++) {
+            int currentTokenIdx = seqTokenIndices[pos];
+            int nextTokenIdx = seqTokenIndices[pos + 1];  // Target token
+            
+            // Skip padding predictions
+            if (nextTokenIdx == PADDING_TOKEN_INDEX) {
+                continue;
+            }
+            
+            // Get softmax probability for the correct next token
+            // vocabScores_postSoftmax is column-major: column 'pos' starts at pos * vocabSize
+            float correctProb = hostVocabSoftmax[pos * vocabSize + nextTokenIdx];
+            
+            // Accumulate loss: -log(probability)
+            if (correctProb > 0.0f) {
+                totalLoss += -logf(correctProb);
+            } else {
+                totalLoss += 100.0f;  // Large penalty for zero probability
+            }
+            numPredictions++;
+            
+            // Get display tokens
+            char currentTokenStr[64];
+            char nextTokenStr[64];
+            getDisplayToken(currentTokenIdx, currentTokenStr, sizeof(currentTokenStr));
+            getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
+            
+            // Print: current --> next (probability%)
+            printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
         }
         
-        // Get softmax probability for the correct next token
-        // vocabScores_postSoftmax is column-major: column 'pos' starts at pos * vocabSize
-        float correctProb = hostVocabSoftmax[pos * vocabSize + nextTokenIdx];
-        
-        // Accumulate loss: -log(probability)
-        if (correctProb > 0.0f) {
-            totalLoss += -logf(correctProb);
-        } else {
-            totalLoss += 100.0f;  // Large penalty for zero probability
-        }
-        numPredictions++;
-        
-        // Get display tokens
-        char currentTokenStr[64];
-        char nextTokenStr[64];
-        getDisplayToken(currentTokenIdx, currentTokenStr, sizeof(currentTokenStr));
-        getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
-        
-        // Print: current --> next (probability%)
-        printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
+        // Calculate and print average loss
+        avgLoss = (numPredictions > 0) ? (totalLoss / numPredictions) : 0.0f;
+        printf("\n--- Sequence Loss: %.4f (over %d predictions) ---\n", avgLoss, numPredictions);
     }
-    
-    // Calculate and print average loss
-    float avgLoss = (numPredictions > 0) ? (totalLoss / numPredictions) : 0.0f;
-    printf("\n--- Sequence Loss: %.4f (over %d predictions) ---\n", avgLoss, numPredictions);
     
     // ========================================================================
     // Compute gradients for backpropagation
@@ -358,6 +376,21 @@ static float processSequence(int storyIndex) {
 // MAIN TRAINING LOOP
 // ============================================================================
 
+// Learning rate warmup configuration
+#define LR_START 1e-5f        // Starting learning rate
+#define LR_END 2e-4f          // Final learning rate after warmup
+#define LR_WARMUP_STEPS 10000 // Number of iterations for warmup
+
+// Calculate learning rate with linear warmup
+static float getLearningRate(int iteration) {
+    if (iteration >= LR_WARMUP_STEPS) {
+        return LR_END;
+    }
+    // Linear interpolation from LR_START to LR_END
+    float progress = (float)iteration / (float)LR_WARMUP_STEPS;
+    return LR_START + progress * (LR_END - LR_START);
+}
+
 int runTrainingLoop(void) {
     printf("\n========================================\n");
     printf("Starting Training Loop\n");
@@ -365,6 +398,7 @@ int runTrainingLoop(void) {
     
     int fileIndex = 1;
     int totalStoriesProcessed = 0;
+    int globalIterationCount = 0;  // Track total optimizer steps
     
     // Iterate through all tokenizedStories_XXXX.json files
     while (true) {
@@ -397,6 +431,10 @@ int runTrainingLoop(void) {
         printf("Loaded %d stories from file %d. Total processed so far: %d\n", 
                numStoriesLoaded, fileIndex, totalStoriesProcessed);
         
+        // Rest period after loading new JSON to let GPU cool down
+        printf("Resting for 20 seconds...\n");
+        sleep(20);
+        
         // ====================================================================
         // TRAINING LOOP FOR THIS FILE'S STORIES
         // Process stories in batches of batchSize
@@ -411,8 +449,13 @@ int runTrainingLoop(void) {
             if (batchEnd > numStoriesLoaded) batchEnd = numStoriesLoaded;
             int currentBatchSize = batchEnd - batchStart;
             
-            printf("\n==== Batch %d/%d (stories %d to %d) ====\n", 
-                   batchIdx + 1, numBatches, batchStart, batchEnd - 1);
+            // Determine if we should print this batch (every N batches)
+            bool shouldPrintThisBatch = (globalIterationCount % PRINT_EVERY_N_BATCHES == 0);
+            
+            if (shouldPrintThisBatch) {
+                printf("\n==== Batch %d/%d (stories %d to %d) [iter %d] ====\n", 
+                       batchIdx + 1, numBatches, batchStart, batchEnd - 1, globalIterationCount + 1);
+            }
             
             float batchTotalLoss = 0.0f;
             
@@ -420,23 +463,36 @@ int runTrainingLoop(void) {
             for (int storyIdxInBatch = 0; storyIdxInBatch < currentBatchSize; storyIdxInBatch++) {
                 int globalStoryIdx = batchStart + storyIdxInBatch;
                 
-                printf("\n>>> Processing story %d (batch item %d/%d) <<<\n", 
-                       globalStoryIdx, storyIdxInBatch + 1, currentBatchSize);
-                
-                // Process sequence: inference + gradient computation + logging
-                float seqLoss = processSequence(globalStoryIdx);
+                // Process sequence: inference + gradient computation
+                // Only print if this is a print batch
+                float seqLoss = processSequence(globalStoryIdx, shouldPrintThisBatch);
                 batchTotalLoss += seqLoss;
                 
-                // Wait for user keypress before continuing
-                waitForKeypress();
+                // Accumulate gradients (reset on first item in batch)
+                bool isFirstInBatch = (storyIdxInBatch == 0);
+                accumulateGradientsFromLastTrainingStep(isFirstInBatch);
+                
+                // Wait for user keypress before continuing (commented out for fast training)
+                // waitForKeypress();
             }
             
-            float batchAvgLoss = batchTotalLoss / currentBatchSize;
-            printf("\n==== Batch %d complete. Average batch loss: %.4f ====\n", 
-                   batchIdx + 1, batchAvgLoss);
+            // Apply optimizer after batch gradient accumulation
+            globalIterationCount++;
+            float currentLR = getLearningRate(globalIterationCount);
+            apply_adeamix_optimizer(globalIterationCount, currentLR);
             
-            // TODO: After batch, update weights using optimizer
-            // apply_adeamix_optimizer(iterationCount, learningRate);
+            if (shouldPrintThisBatch) {
+                float batchAvgLoss = batchTotalLoss / currentBatchSize;
+                printf("\n==== Batch %d complete. Avg loss: %.4f | Optimizer step %d (lr=%.6f) ====\n", 
+                       batchIdx + 1, batchAvgLoss, globalIterationCount, currentLR);
+            }
+            
+            // Save model weights every SAVE_EVERY_N_ITERATIONS
+            if (globalIterationCount > 0 && globalIterationCount % SAVE_EVERY_N_ITERATIONS == 0) {
+                char saveFilePath[256];
+                snprintf(saveFilePath, sizeof(saveFilePath), MODEL_SAVE_PATH, globalIterationCount);
+                saveModelWeights(saveFilePath, globalIterationCount);
+            }
         }
         
         printf("Finished processing file %d.\n\n", fileIndex);

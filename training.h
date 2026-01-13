@@ -7,3 +7,8 @@ void setupRoPEThetaStore(void);
 // leftStartIndex: starting token index (inclusive) for gradient computation
 // rightEndIndex: ending token index (inclusive) for gradient computation
 void getGradientsForTraining(int leftStartIndex, int rightEndIndex);
+
+// Accumulate gradients from the last training step into batch accumulation buffers
+// resetGradAccumulation: if true, copy gradients directly (first item in batch)
+//                        if false, add gradients to existing accumulation
+void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation);

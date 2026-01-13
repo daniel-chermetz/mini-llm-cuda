@@ -1,9 +1,9 @@
 /*
 nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
      inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
-     training_orchestrator.cu optimizer.cu \
+     training_orchestrator.cu optimizer.cu random_weights.cu save_model.cu \
      -o inference \
-     -lcublas \
+     -lcublas -lcurand \
      -arch=sm_86
 */
 
@@ -25,6 +25,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu train
 #include "gradient_testing.h"
 #include "memory_allocation.h"
 #include "training_orchestrator.h"
+#include "random_weights.h"
 
 // ============================================================================
 // TOKENIZED STORY LOADING AND CONTEXT SETUP
@@ -172,6 +173,7 @@ int loadStoryContext(const char* storiesPath, int storyIndex, int percentage) {
 
 int main(int argc, char* argv[]) {
     cublasCreate(&handle);
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
     allocateMemory(true);
     
@@ -181,10 +183,13 @@ int main(int argc, char* argv[]) {
     //char* modelName = "model_12_lr_4e6";
     //char* modelName = "model_13_lr_3e6";
     //char* modelName = "model_14_lr_3e6";
-    char* modelName = "model_15_lr_3e6";
-    if (!loadModel(modelName)) {
-        printf("Failed to load model '%s', using random weights.\n", modelName);
-    }
+    // char* modelName = "model_15_lr_3e6";
+    // if (!loadModel(modelName)) {
+    //     printf("Failed to load model '%s', using random weights.\n", modelName);
+    // }
+    
+    // Use random weights for training from scratch
+    initializeRandomWeights(0.02f);  // Range: [-0.02, +0.02]
     
     // Load vocabulary
     char vocabPath[512];
