@@ -8,20 +8,17 @@
 #include <string.h>
 #include <math.h>
 #include <cuda_runtime.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "network_meta.h"
-#include "network_globals.h"  // Must come before <termios.h> to avoid cuBLAS macro conflicts
+#include "network_globals.h"
 #include "load_model.h"
 #include "inference.h"
 #include "training.h"
 #include "training_orchestrator.h"
-
-// System headers that may define conflicting macros (include after cuBLAS)
-#include <sys/stat.h>
-#include <dirent.h>
-#include <termios.h>
-#include <unistd.h>
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -57,16 +54,13 @@ static void getStoriesFilePath(int fileIndex, char* outPath, size_t outSize) {
     snprintf(outPath, outSize, "%s/tokenizedStories_%04d.json", TOKENIZED_STORIES_PATH, fileIndex);
 }
 
-// Wait for user to press any key
+// Wait for user to press Enter
 static void waitForKeypress() {
-    printf("\nPress any key to continue...\n");
-    struct termios oldt, newt;
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    getchar();
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    printf("\nPress Enter to continue...\n");
+    // Clear any pending input
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) {}
+    getchar();  // Wait for Enter
 }
 
 // Get display-safe token string
@@ -288,7 +282,7 @@ static float processSequence(int storyIndex) {
     // check here about 257 <--- Daniel
     cudaMemcpy(seqTokenIndices_DEVICE, 
                trainingStoryTokens_DEVICE + storyOffset, 
-               L * sizeof(int), 
+               TOKENS_PER_STORY * sizeof(int), 
                cudaMemcpyDeviceToDevice);
     
     // Also copy to host seqTokenIndices for token display
@@ -408,12 +402,12 @@ int runTrainingLoop(void) {
         // Process stories in batches of batchSize
         // ====================================================================
         
-        int numBatches = (numStoriesLoaded + batchSize - 1) / batchSize;
-        printf("Processing %d batches (batch size = %d)...\n", numBatches, batchSize);
+        int numBatches = (numStoriesLoaded + TRAINING_BATCH_SIZE - 1) / TRAINING_BATCH_SIZE;
+        printf("Processing %d batches (batch size = %d)...\n", numBatches, TRAINING_BATCH_SIZE);
         
         for (int batchIdx = 0; batchIdx < numBatches; batchIdx++) {
-            int batchStart = batchIdx * batchSize;
-            int batchEnd = batchStart + batchSize;
+            int batchStart = batchIdx * TRAINING_BATCH_SIZE;
+            int batchEnd = batchStart + TRAINING_BATCH_SIZE;
             if (batchEnd > numStoriesLoaded) batchEnd = numStoriesLoaded;
             int currentBatchSize = batchEnd - batchStart;
             

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "network_meta.h"  // For L
+
 // Maximum number of stories that can be loaded at once
 #define MAX_TRAINING_STORIES 11000
 // Number of tokens per story (L+1 = 257)
