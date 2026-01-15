@@ -246,7 +246,7 @@ static void allocateTrainingMemory() {
     // Precompute beta powers for all iterations (indices 1 to maxIterations)
     int numBlocks = (maxIterations + threadsPerBlock - 1) / threadsPerBlock;
     preCalcPowBeta<<<numBlocks, threadsPerBlock>>>(beta1_pow_store, beta2_pow_store, beta3_pow_store, maxIterations, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3);
-    cudaDeviceSynchronize(); // ask we need it
+    cudaDeviceSynchronize(); // ask why we need it
 
     // Allocate training stories memory: 11,000 stories x 257 tokens per story
     cudaMalloc((void**)&trainingStoryTokens_DEVICE, MAX_TRAINING_STORIES * TOKENS_PER_STORY * sizeof(int));

@@ -51,12 +51,20 @@ __global__ void update_weights_per_adeamix(float* weight, float* fastEMA, float*
 
     float fastEMABiased = fastEMA[index] / beta1_pow_store[iterationNum];
     float slowEMABiased = slowEMA[index] / beta3_pow_store[iterationNum];
-    float varianceBiased = variance[index] / beta2_pow_store[iterationNum];
+    float varianceBiasedFinal = sqrtf(variance[index] / beta2_pow_store[iterationNum]) + 1e-8f;
+    if (varianceBiasedFinal < 0.1f) {
+    	varianceBiasedFinal = 0.1f;
+    }
 
     float momentum_final = fastEMABiased + ALPHA_ * slowEMABiased;
-    float momentum_variance_scaled_final = momentum_final / (sqrtf(varianceBiased) + 1e-8f);
+    float momentum_variance_scaled_final = momentum_final / varianceBiasedFinal;
     
-	weight[index] = weight[index] - learningRate * momentum_variance_scaled_final - learningRate * WEIGHT_DECAY_ * weight[index];
+    float update = learningRate * momentum_variance_scaled_final;
+    if (update < 0.001f && update > -0.001f) {
+		weight[index] = weight[index] - update - learningRate * WEIGHT_DECAY_ * weight[index];
+    } else {
+		weight[index] = weight[index] - (update / fabsf(update / 0.001f)) - learningRate * WEIGHT_DECAY_ * weight[index];    	
+    }
 }
 
 __global__ void update_weights_per_adeamix_decay_relative_to_one(float* weight, float* fastEMA, float* slowEMA, float* variance, float* beta1_pow_store, float* beta2_pow_store, float* beta3_pow_store, float learningRate, int iterationNum, float ALPHA_, float WEIGHT_DECAY_, int size) {
@@ -67,12 +75,20 @@ __global__ void update_weights_per_adeamix_decay_relative_to_one(float* weight, 
 
     float fastEMABiased = fastEMA[index] / beta1_pow_store[iterationNum];
     float slowEMABiased = slowEMA[index] / beta3_pow_store[iterationNum];
-    float varianceBiased = variance[index] / beta2_pow_store[iterationNum];
+    float varianceBiasedFinal = sqrtf(variance[index] / beta2_pow_store[iterationNum]) + 1e-8f;
+    if (varianceBiasedFinal < 0.1f) {
+    	varianceBiasedFinal = 0.1f;
+    }    
 
     float momentum_final = fastEMABiased + ALPHA_ * slowEMABiased;
-    float momentum_variance_scaled_final = momentum_final / (sqrtf(varianceBiased) + 1e-8f);
+    float momentum_variance_scaled_final = momentum_final / varianceBiasedFinal;
     
-	weight[index] = weight[index] - learningRate * momentum_variance_scaled_final - learningRate * WEIGHT_DECAY_ * (1.0f - weight[index]);
+    float update = learningRate * momentum_variance_scaled_final;
+    if (update < 0.001f && update > -0.001f) {
+		weight[index] = weight[index] - update - learningRate * WEIGHT_DECAY_ * (weight[index] - 1.0f);
+    } else {
+		weight[index] = weight[index] - (update / fabsf(update / 0.001f)) - learningRate * WEIGHT_DECAY_ * (weight[index] - 1.0f);
+    }
 }
 
 __global__ void update_weights_per_adeamix_no_decay(float* weight, float* fastEMA, float* slowEMA, float* variance, float* beta1_pow_store, float* beta2_pow_store, float* beta3_pow_store, float learningRate, int iterationNum, float ALPHA_, int size) {
@@ -83,12 +99,20 @@ __global__ void update_weights_per_adeamix_no_decay(float* weight, float* fastEM
 
     float fastEMABiased = fastEMA[index] / beta1_pow_store[iterationNum];
     float slowEMABiased = slowEMA[index] / beta3_pow_store[iterationNum];
-    float varianceBiased = variance[index] / beta2_pow_store[iterationNum];
+    float varianceBiasedFinal = sqrtf(variance[index] / beta2_pow_store[iterationNum]) + 1e-8f;
+    if (varianceBiasedFinal < 0.1f) {
+    	varianceBiasedFinal = 0.1f;
+    }
 
     float momentum_final = fastEMABiased + ALPHA_ * slowEMABiased;
-    float momentum_variance_scaled_final = momentum_final / (sqrtf(varianceBiased) + 1e-8f);
+    float momentum_variance_scaled_final = momentum_final / varianceBiasedFinal;
     
-	weight[index] = weight[index] - learningRate * momentum_variance_scaled_final;
+    float update = learningRate * momentum_variance_scaled_final;
+    if (update < 0.001f && update > -0.001f) {
+		weight[index] = weight[index] - update;
+    } else {
+		weight[index] = weight[index] - (update / fabsf(update / 0.001f));
+    }
 }
 
 void apply_adeamix_optimizer(int iterationNum, float learningRate) {
@@ -108,12 +132,12 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate) {
 	// ============================================================================
 	// FINAL RMS GAMMA WEIGHTS
 	// ============================================================================
-	/*xTotalThreads = dim;
+	xTotalThreads = dim;
 	numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 	update_fast_EMA<<<numBlocks, threadsPerBlock>>>(fastEMA_final_RMS_gamma_weights, gradientAccumulation_final_RMS_gamma_weights, ADEAMIX_BETA1, xTotalThreads);
 	update_slow_EMA<<<numBlocks, threadsPerBlock>>>(slowEMA_final_RMS_gamma_weights, gradientAccumulation_final_RMS_gamma_weights, ADEAMIX_BETA3, xTotalThreads);
 	update_variance<<<numBlocks, threadsPerBlock>>>(variance_final_RMS_gamma_weights, gradientAccumulation_final_RMS_gamma_weights, ADEAMIX_BETA2, xTotalThreads);
-	update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(final_rms_weights_DEVICE, fastEMA_final_RMS_gamma_weights, slowEMA_final_RMS_gamma_weights, variance_final_RMS_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);*/
+	update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(final_rms_weights_DEVICE, fastEMA_final_RMS_gamma_weights, slowEMA_final_RMS_gamma_weights, variance_final_RMS_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 
 	// ============================================================================
 	// TRANSFORMER LAYER WEIGHTS
@@ -142,12 +166,12 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate) {
 		update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].ffn_right_2_weights, fastEMA[t].ffn_right_2_weights, slowEMA[t].ffn_right_2_weights, variance[t].ffn_right_2_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 
 		// RMS2 Gamma Weights (dim)
-		/*xTotalThreads = dim;
+		xTotalThreads = dim;
 		numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		update_fast_EMA<<<numBlocks, threadsPerBlock>>>(fastEMA[t].rms2_gamma_weights, gradientAccumulation[t].rms2_gamma_weights, ADEAMIX_BETA1, xTotalThreads);
 		update_slow_EMA<<<numBlocks, threadsPerBlock>>>(slowEMA[t].rms2_gamma_weights, gradientAccumulation[t].rms2_gamma_weights, ADEAMIX_BETA3, xTotalThreads);
 		update_variance<<<numBlocks, threadsPerBlock>>>(variance[t].rms2_gamma_weights, gradientAccumulation[t].rms2_gamma_weights, ADEAMIX_BETA2, xTotalThreads);
-		update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].rms2_weights, fastEMA[t].rms2_gamma_weights, slowEMA[t].rms2_gamma_weights, variance[t].rms2_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);*/
+		update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].rms2_weights, fastEMA[t].rms2_gamma_weights, slowEMA[t].rms2_gamma_weights, variance[t].rms2_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 
 		// Output Projection Weights (dim x dim)
 		xTotalThreads = dim * dim;
@@ -176,11 +200,11 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate) {
 		update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].key_weights, fastEMA[t].key_weights, slowEMA[t].key_weights, variance[t].key_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 
 		// RMS1 Gamma Weights (dim)
-		/*xTotalThreads = dim;
+		xTotalThreads = dim;
 		numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		update_fast_EMA<<<numBlocks, threadsPerBlock>>>(fastEMA[t].rms1_gamma_weights, gradientAccumulation[t].rms1_gamma_weights, ADEAMIX_BETA1, xTotalThreads);
 		update_slow_EMA<<<numBlocks, threadsPerBlock>>>(slowEMA[t].rms1_gamma_weights, gradientAccumulation[t].rms1_gamma_weights, ADEAMIX_BETA3, xTotalThreads);
 		update_variance<<<numBlocks, threadsPerBlock>>>(variance[t].rms1_gamma_weights, gradientAccumulation[t].rms1_gamma_weights, ADEAMIX_BETA2, xTotalThreads);
-		update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].rms1_weights, fastEMA[t].rms1_gamma_weights, slowEMA[t].rms1_gamma_weights, variance[t].rms1_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);*/
+		update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].rms1_weights, fastEMA[t].rms1_gamma_weights, slowEMA[t].rms1_gamma_weights, variance[t].rms1_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 	}
 }

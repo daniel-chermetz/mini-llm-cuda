@@ -378,8 +378,8 @@ static float processSequence(int storyIndex, bool shouldPrint) {
 
 // Learning rate warmup configuration
 #define LR_START 1e-5f        // Starting learning rate
-#define LR_END 2e-4f          // Final learning rate after warmup
-#define LR_WARMUP_STEPS 10000 // Number of iterations for warmup
+#define LR_END 9e-5f          // Final learning rate after warmup
+#define LR_WARMUP_STEPS 20000 // Number of iterations for warmup
 
 // Calculate learning rate with linear warmup
 static float getLearningRate(int iteration) {
