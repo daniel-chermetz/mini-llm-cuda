@@ -21,22 +21,32 @@ __global__ void setInputSeqEmbeddings(float* x, int* seqTokenIndices, float* emb
     x[currentIndex] = embedding_weights[tokenIndex * dim_ + rowIndex];
 }
 
-__global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_, int L_) {
-    int colIndex = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxColIndex = L_ - 1;
-    
-    if (colIndex > maxColIndex) {
-        return;
+__global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_) {
+    int colIndex = blockIdx.x;
+    int tIndex = threadIdx.x;
+
+    int colOffset = colIndex * dim_;
+
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2    
+
+    float threadSum = 0.0f;
+    for (int rowIndex = tIndex; rowIndex < dim_; rowIndex += blockDim.x) {
+        float val = x[colOffset + rowIndex];
+        threadSum += (val * val);
+    }
+    sData[tIndex] = threadSum;
+    __syncthreads();
+
+    for (int reductionSize = blockDim.x / 2; reductionSize > 0; reductionSize /= 2) {
+        if (tIndex < reductionSize) {
+            sData[tIndex] = sData[tIndex] + sData[tIndex + reductionSize];
+        }
+        __syncthreads();
     }
 
-    int colOffset = dim_ * colIndex;
-
-    float sumSquared = 0;
-    for (int i = 0; i < dim_; i++) {
-        float val = x[colOffset + i];
-        sumSquared += (val * val);
+    if (tIndex == 0) {
+        rmsSumByCol[colIndex] = sqrtf((sData[0] / dim_) + 1e-8);
     }
-    rmsSumByCol[colIndex] = sqrtf((sumSquared / dim_) + 1e-8);
 }
 
 __global__ void applyRMSNorm(float* postRMS_post_gamma, float* postRMS_pre_gamma, float* preRMS, float* rmsSumByCol, float* rms_weights, int dim_, int L_) {
@@ -55,28 +65,25 @@ __global__ void applyRMSNorm(float* postRMS_post_gamma, float* postRMS_pre_gamma
 
 __global__ void applyRoPE(float* keysOrValuesPostRoPE, float* keysOrValues, float* preComputedRopeTheta, int headDim_, int dim_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = dim_ * L_ - 1;
-    if (index > maxIndex) {
+    int maxCount = dim_ / 2 * L_;
+    if (index >= maxCount) {
         return;
     }
 
-    int colIndex = index / dim_;
-    int rowIndex = index - colIndex * dim_;
+    int effectiveIndex = index * 2;
+    int colIndex = effectiveIndex / dim_;
+    int rowIndex = effectiveIndex - colIndex * dim_;
     int headIndex = rowIndex / headDim_;
     int headRelativeRowIndex = rowIndex - headIndex * headDim_;
     int headRelativeColOffset = colIndex * headDim_;
 
-    if (headRelativeRowIndex % 2 == 0) {
-        float cosTheta = preComputedRopeTheta[headRelativeColOffset + headRelativeRowIndex];
-        float sinTheta = preComputedRopeTheta[headRelativeColOffset + headRelativeRowIndex + 1];
+    float cosTheta = preComputedRopeTheta[headRelativeColOffset + headRelativeRowIndex];
+    float sinTheta = preComputedRopeTheta[headRelativeColOffset + headRelativeRowIndex + 1];
+    float firstValOfPair = keysOrValues[effectiveIndex];
+    float secondValOfPair = keysOrValues[effectiveIndex + 1];
 
-        keysOrValuesPostRoPE[index] = cosTheta * keysOrValues[index] - sinTheta * keysOrValues[index + 1];
-    } else {
-        float cosTheta = preComputedRopeTheta[headRelativeColOffset + headRelativeRowIndex - 1];
-        float sinTheta = preComputedRopeTheta[headRelativeColOffset + headRelativeRowIndex];
-
-        keysOrValuesPostRoPE[index] = sinTheta * keysOrValues[index - 1] + cosTheta * keysOrValues[index];
-    }
+    keysOrValuesPostRoPE[effectiveIndex] = cosTheta * firstValOfPair - sinTheta * secondValOfPair;
+    keysOrValuesPostRoPE[effectiveIndex + 1] = sinTheta * firstValOfPair + cosTheta * secondValOfPair;
 }
 
 __global__ void getHeadDimScaledMaskedAttn(float* attnKtQByHeadScaledMasked, float* attnKtQByHead, int attnHeads_, int headDim_, int L_) {
@@ -101,49 +108,73 @@ __global__ void getHeadDimScaledMaskedAttn(float* attnKtQByHeadScaledMasked, flo
 }
 
 __global__ void getAttnHeadsMaxByCol_softmax(float* attnByHead_maxByCol_softmax, float* attnHeadDimScaledMaskedKtQByHead, int attnHeads_, int L_) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = attnHeads_ * L_ - 1;
-    if (index > maxIndex) {
-        return;
-    }
+    int attnHeadIndex = blockIdx.x;
+    int headRelativeColIndex = blockIdx.y;
+    int tIndex = threadIdx.x; // rowIndex
 
-    float colMax = -1.0e20f;
-    int headIndex = index / L_;
-    int colIndex = index - headIndex * L_;
-    int colOffset = index * L_;
-    for (int rowIndex = 0; rowIndex <= colIndex; rowIndex++) {
-        float val = attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex];
-        if (val > colMax) {
-            colMax = val;
+    int colIndex = attnHeadIndex * L_ + headRelativeColIndex;
+    int colOffset = colIndex * L_;
+
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2    
+
+    float threadColMax = -1.0e20f;
+    for (int rowIndex = tIndex; rowIndex <= headRelativeColIndex; rowIndex += blockDim.x) {
+        if (attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex] > threadColMax) {
+            threadColMax = attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex];
         }
     }
+    sData[tIndex] = threadColMax;
+    __syncthreads();
 
-    attnByHead_maxByCol_softmax[index] = colMax;
+    for (int reductionSize = blockDim.x / 2; reductionSize > 0; reductionSize /= 2) {
+        if (tIndex < reductionSize) {
+            sData[tIndex] = sData[tIndex] > sData[tIndex + reductionSize] ? sData[tIndex] : sData[tIndex + reductionSize];
+        }
+        __syncthreads();
+    }
+
+    if (tIndex == 0) {
+        attnByHead_maxByCol_softmax[colIndex] = sData[0];
+    }
 }
 
-__global__ void getAttnHeadsSumByCol_softmax(float* attnByHead_sumByCol_softmax, float* attnHeadDimScaledMaskedKtQByHead, float* attnByHead_maxByCol_softmax, int attnHeads_, int L_) {
+__global__ void getAttnHeadsSumByCol_softmax(float* attnByHead_sumByCol_softmax, float* attnByHead_expfCache_softmax, float* attnHeadDimScaledMaskedKtQByHead, float* attnByHead_maxByCol_softmax, int attnHeads_, int L_) {
+    int attnHeadIndex = blockIdx.x;
+    int headRelativeColIndex = blockIdx.y;
+    int tIndex = threadIdx.x; // rowIndex
+
+    int colIndex = attnHeadIndex * L_ + headRelativeColIndex;
+    int colOffset = colIndex * L_;
+
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2
+
+    float threadSum = 0.0f;
+    for (int rowIndex = tIndex; rowIndex <= headRelativeColIndex; rowIndex += blockDim.x /* numThreads per block */) {
+        float expVal = expf(attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex] - attnByHead_maxByCol_softmax[colIndex]);
+        attnByHead_expfCache_softmax[colOffset + rowIndex] = expVal;
+        threadSum += expVal;
+    }
+    sData[tIndex] = threadSum;
+    __syncthreads();
+
+    // blockDim.x = 256; reductionSize = 128; reductionSize > 0; reductionSize: 128, 64, 32, 16, etc.
+    for (int reductionSize = (blockDim.x / 2); reductionSize > 0; reductionSize /= 2) {
+        if (tIndex < reductionSize) {
+            sData[tIndex] = sData[tIndex] + sData[tIndex + reductionSize];
+        }
+        __syncthreads();
+    }
+
+    if (tIndex == 0) {
+        attnByHead_sumByCol_softmax[colIndex] = sData[0];
+    }
+}
+
+__global__ void applySoftmaxToAttnHeads(float* attnByHead_postSoftmax, float* expfCache, float* sumByCol, int attnHeads_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = attnHeads_ * L_ - 1;
-    if (index > maxIndex) {
-        return;
-    }
-
-    float sum = 0.0f;
-    int headIndex = index / L_;
-    int colIndex = index - headIndex * L_;    
-    int colOffset = index * L_;
-    for (int rowIndex = 0; rowIndex <= colIndex; rowIndex++) {
-        sum += expf(attnHeadDimScaledMaskedKtQByHead[colOffset + rowIndex] - attnByHead_maxByCol_softmax[index]);
-    }
-    attnByHead_sumByCol_softmax[index] = sum;
-}
-
-__global__ void applySoftmaxToAttnHeads(float* attnByHead_postSoftmax, float* attnHeadDimScaledMaskedKtQByHead, float* sumByCol, float* maxByCol, int attnHeads_, int L_) {
     int L2 = L_ * L_;
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = attnHeads_ * L2 - 1;
-    if (index > maxIndex) {
+    int maxCount = attnHeads_ * L2;
+    if (index >= maxCount) {
         return;
     }
 
@@ -153,7 +184,7 @@ __global__ void applySoftmaxToAttnHeads(float* attnByHead_postSoftmax, float* at
     int rowIndex = index - globalColIndex * L_;
 
     if (rowIndex <= headRelativeColIndex) {
-        attnByHead_postSoftmax[index] = (expf(attnHeadDimScaledMaskedKtQByHead[index] - maxByCol[globalColIndex]) / sumByCol[globalColIndex]);
+        attnByHead_postSoftmax[index] = (expfCache[index] / sumByCol[globalColIndex]);
         return;
     }
 
@@ -201,54 +232,80 @@ __global__ void addResidualToFFN(float* ffnPlusResidual, float* ffn_final, float
     ffnPlusResidual[index] = ffn_final[index] + xFromTransformerStart[index];
 }
 
-__global__ void getVocabMaxByCol_softmax(float* vocab_maxByCol_softmax, float* vocabScores, int vocabSize_, int L_) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = L_ - 1;
-    if (index > maxIndex) {
-        return;
-    }
+__global__ void getVocabMaxByCol_softmax(float* vocab_maxByCol_softmax, float* vocabScores, int vocabSize_) {
+    int colIndex = blockIdx.x;
+    int tIndex = threadIdx.x; // rowIndex
 
-    float colMax = -1.0e20f;
-    int colOffset = index * vocabSize_;
-    for (int rowIndex = 0; rowIndex < vocabSize_; rowIndex++) {
-        float val = vocabScores[colOffset + rowIndex];
-        if (val > colMax) {
-            colMax = val;
+    int colOffset = colIndex * vocabSize_;
+
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2    
+
+    float threadColMax = -1.0e20f;
+    for (int rowIndex = tIndex; rowIndex < vocabSize_; rowIndex += blockDim.x) {
+        if (vocabScores[colOffset + rowIndex] > threadColMax) {
+            threadColMax = vocabScores[colOffset + rowIndex];
         }
     }
+    sData[tIndex] = threadColMax;
+    __syncthreads();
 
-    vocab_maxByCol_softmax[index] = colMax;
-}
-
-__global__ void getVocabSumByCol_softmax(float* vocab_sumByCol_softmax, float* vocabScores, float* vocab_maxByCol_softmax, int vocabSize_, int L_) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = L_ - 1;
-    if (index > maxIndex) {
-        return;
+    for (int reductionSize = blockDim.x / 2; reductionSize > 0; reductionSize /= 2) {
+        if (tIndex < reductionSize) {
+            sData[tIndex] = sData[tIndex] > sData[tIndex + reductionSize] ? sData[tIndex] : sData[tIndex + reductionSize];
+        }
+        __syncthreads();
     }
 
-    float sum = 0.0f;
-    int colOffset = index * vocabSize_;
-    for (int rowIndex = 0; rowIndex < vocabSize_; rowIndex++) {
-        sum += expf(vocabScores[colOffset + rowIndex] - vocab_maxByCol_softmax[index]);
+    if (tIndex == 0) {
+        vocab_maxByCol_softmax[colIndex] = sData[0];
     }
-    vocab_sumByCol_softmax[index] = sum;
 }
 
-__global__ void applySoftmaxToVocab(float* vocabScores_postSoftmax, float* vocabScores, float* vocab_sumByCol_softmax, float* vocab_maxByCol_softmax, int vocabSize_, int L_) {
+__global__ void getVocabSumByCol_softmax(float* vocab_sumByCol_softmax, float* vocab_expfCache_softmax, float* vocabScores, float* vocab_maxByCol_softmax, int vocabSize_) {
+    int colIndex = blockIdx.x;
+    int tIndex = threadIdx.x; // rowIndex
+
+    int colOffset = colIndex * vocabSize_;
+
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2
+
+    float threadSum = 0.0f;
+    float colMax = vocab_maxByCol_softmax[colIndex];
+    for (int rowIndex = tIndex; rowIndex < vocabSize_; rowIndex += blockDim.x /* numThreads per block */) {
+        float expVal = expf(vocabScores[colOffset + rowIndex] - colMax);
+        vocab_expfCache_softmax[colOffset + rowIndex] = expVal;
+        threadSum += expVal;
+    }
+    sData[tIndex] = threadSum;
+    __syncthreads();
+
+    // blockDim.x = 256; reductionSize = 128; reductionSize > 0; reductionSize: 128, 64, 32, 16, etc.
+    for (int reductionSize = (blockDim.x / 2); reductionSize > 0; reductionSize /= 2) {
+        if (tIndex < reductionSize) {
+            sData[tIndex] = sData[tIndex] + sData[tIndex + reductionSize];
+        }
+        __syncthreads();
+    }
+
+    if (tIndex == 0) {
+        vocab_sumByCol_softmax[colIndex] = sData[0];
+    }
+}
+
+__global__ void applySoftmaxToVocab(float* vocabScores_postSoftmax, float* vocab_expfCache, float* vocab_sumByCol_softmax, int vocabSize_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int maxIndex = vocabSize_ * L_ - 1;
-    if (index > maxIndex) {
+    int maxCount = vocabSize_ * L_;
+    if (index >= maxCount) {
         return;
     }
 
     int colIndex = index / vocabSize_;
-    vocabScores_postSoftmax[index] = (expf(vocabScores[index] - vocab_maxByCol_softmax[colIndex]) / vocab_sumByCol_softmax[colIndex]);
+    vocabScores_postSoftmax[index] = vocab_expfCache[index] / vocab_sumByCol_softmax[colIndex];
 }
 
-void getPreComputedRopeTheta(float* preComputedRopeTheta) {
+void getPreComputedRopeTheta(float* preComputedRopeTheta, int maxL_) {
     int numPairs = headDim / 2;
-    for (int colIndex = 0; colIndex < L; colIndex++) {
+    for (int colIndex = 0; colIndex < maxL_; colIndex++) {
         int colOffset = colIndex * headDim;
         for (int pairIndex = 0; pairIndex < numPairs; pairIndex++) {
             float theta = colIndex * powf(ropeDenomBase, (-2.0f * pairIndex / headDim));
@@ -258,20 +315,20 @@ void getPreComputedRopeTheta(float* preComputedRopeTheta) {
     }
 }
 
-int runInference() {
+int runInference(int L) {
     int xTotalThreads = L * dim;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+    size_t sharedMemSize = 256 * sizeof(float);
+
     setInputSeqEmbeddings<<<numBlocks, threadsPerBlock>>>(x_DEVICE, seqTokenIndices_DEVICE, embedding_weights_DEVICE, dim, L);
 
     for (int tIndexCountUp = 0; tIndexCountUp < transformers; tIndexCountUp++) {
         int tIndex = transformers - 1 - tIndexCountUp;
 
-        xTotalThreads = L;
-        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
         if (tIndex == transformers - 1) {
-            getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, x_DEVICE, dim, L);
+            getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, x_DEVICE, dim);
         } else {
-            getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim, L);
+            getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim);
         }
 
         xTotalThreads = dim * L;
@@ -348,7 +405,7 @@ int runInference() {
             CUBLAS_GEMM_DEFAULT             
         );
 
-        xTotalThreads = dim * L;
+        xTotalThreads = dimPairs * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;   
         applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
         applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
@@ -384,13 +441,12 @@ int runInference() {
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
         getHeadDimScaledMaskedAttn<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnKtQByHead, attnHeads, headDim, L);
 
-        xTotalThreads = attnHeads * L;
-        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        getAttnHeadsMaxByCol_softmax<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, attnHeads, L);
-        getAttnHeadsSumByCol_softmax<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
+        dim3 attnSoftmaxGridDim(attnHeads, L);
+        getAttnHeadsMaxByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, attnHeads, L);
+        getAttnHeadsSumByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
         xTotalThreads = attnHeads * L * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
-        applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
+        applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
 
         // V @ attnByHead_postSoftmax
         cublasGemmStridedBatchedEx(
@@ -450,9 +506,7 @@ int runInference() {
             addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim, L);
         }      
 
-        xTotalThreads = L;
-        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        getRMSColSums<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, dim, L);
+        getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, dim);
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
         applyRMSNorm<<<numBlocks, threadsPerBlock>>>(
@@ -545,9 +599,7 @@ int runInference() {
     // char* filename_final_ffn_plus_residual = "final_FFN_plus_residual";
     // saveTensorToJSON_WebGPULayout(transformerCalculations_DEVICE[0].ffnPlusResidual, dim, L, filename_final_ffn_plus_residual);
 
-    xTotalThreads = L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    getRMSColSums<<<numBlocks, threadsPerBlock>>>(ffn_sumByCol_RMS_DEVICE, transformerCalculations_DEVICE[0].ffnPlusResidual, dim, L);
+    getRMSColSums<<<L, 256, sharedMemSize>>>(ffn_sumByCol_RMS_DEVICE, transformerCalculations_DEVICE[0].ffnPlusResidual, dim);
     xTotalThreads = dim * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
     applyRMSNorm<<<numBlocks, threadsPerBlock>>>(
@@ -587,13 +639,11 @@ int runInference() {
         CUBLAS_GEMM_DEFAULT
     );
 
-    xTotalThreads = L;
-    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    getVocabMaxByCol_softmax<<<numBlocks, threadsPerBlock>>>(vocabScores_maxByCol_softmax_DEVICE, vocabScores_DEVICE, vocabSize, L);
-    getVocabSumByCol_softmax<<<numBlocks, threadsPerBlock>>>(vocabScores_sumByCol_softmax_DEVICE, vocabScores_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
+    getVocabMaxByCol_softmax<<<L, 256, sharedMemSize>>>(vocabScores_maxByCol_softmax_DEVICE, vocabScores_DEVICE, vocabSize);
+    getVocabSumByCol_softmax<<<L, 256, sharedMemSize>>>(vocabScores_sumByCol_softmax_DEVICE, vocabScores_expfCache_softmax_DEVICE, vocabScores_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize);
     xTotalThreads = vocabSize * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    applySoftmaxToVocab<<<numBlocks, threadsPerBlock>>>(vocabScores_postSoftmax_DEVICE, vocabScores_DEVICE, vocabScores_sumByCol_softmax_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
+    applySoftmaxToVocab<<<numBlocks, threadsPerBlock>>>(vocabScores_postSoftmax_DEVICE, vocabScores_expfCache_softmax_DEVICE, vocabScores_DEVICE, vocabScores_sumByCol_softmax_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
 
     return 0;
 }

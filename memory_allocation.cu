@@ -222,7 +222,7 @@ static void allocateTrainingMemory() {
     }
 
     // Setup RoPE theta store for training
-    setupRoPEThetaStore();
+    setupRoPEThetaStore(maxL);
 
     // Allocate optimizer state memory
     allocateBatchGradAccumulationMemory();
@@ -320,7 +320,7 @@ void allocateMemory(bool allocateTraining) {
     // Precomputed RoPE theta
     size_t preComputedRopeTheta_size = headDim * L * sizeof(float);
     preComputedRopeTheta = (float*)malloc(preComputedRopeTheta_size);
-    getPreComputedRopeTheta(preComputedRopeTheta);
+    getPreComputedRopeTheta(preComputedRopeTheta, maxL);
     cudaMalloc((void**)&preComputedRopeTheta_DEVICE, preComputedRopeTheta_size);
     cudaMemcpy(preComputedRopeTheta_DEVICE, preComputedRopeTheta, preComputedRopeTheta_size, cudaMemcpyHostToDevice);
 
@@ -418,6 +418,7 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHeadScaledMasked, attnHeads * L * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_maxByCol_softmax, attnHeads * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_sumByCol_softmax, attnHeads * L * sizeof(float));
+        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_expfCache_softmax, attnHeads * L * L * sizeof(float));        
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_postSoftmax, attnHeads * L * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].valueScaledSoftmaxAttn, dim * L * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProj, dim * L * sizeof(float));
@@ -441,6 +442,7 @@ void allocateMemory(bool allocateTraining) {
     cudaMalloc((void**)&vocabScores_DEVICE, vocabSize * L * sizeof(float));
     cudaMalloc((void**)&vocabScores_maxByCol_softmax_DEVICE, L * sizeof(float));
     cudaMalloc((void**)&vocabScores_sumByCol_softmax_DEVICE, L * sizeof(float));
+    cudaMalloc((void**)&vocabScores_expfCache_softmax_DEVICE, vocabSize * L * sizeof(float));
     cudaMalloc((void**)&vocabScores_postSoftmax_DEVICE, vocabSize * L * sizeof(float));
 
     if (allocateTraining) {

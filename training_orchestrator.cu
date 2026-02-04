@@ -367,7 +367,7 @@ static float processSequence(int storyIndex, bool shouldPrint) {
     // ========================================================================
     // Compute gradients for backpropagation
     // ========================================================================
-    getGradientsForTraining(leftStartIndex, rightEndIndex);
+    getGradientsForTraining(leftStartIndex, rightEndIndex, L); // L needs to be figured out from the sequence
     
     return avgLoss;
 }

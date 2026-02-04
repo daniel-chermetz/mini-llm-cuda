@@ -8,7 +8,7 @@
 #define ffnDimMultiplier 4
 #define ffnDim 2048
 #define transformers 8
-#define L 256
+#define maxL 1280
 #define vocabSize 10096
 
 #define TRAINING_BATCH_SIZE 4

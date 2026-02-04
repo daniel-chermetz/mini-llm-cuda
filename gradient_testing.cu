@@ -455,7 +455,7 @@ int runGradientTests(void) {
     printf("  rightEndIndex: %d\n", rightEndIndex);
     printf("\n");
     
-    getGradientsForTraining(leftStartIndex, rightEndIndex);
+    getGradientsForTraining(leftStartIndex, rightEndIndex, L); // L needs to be figuted out from the sequence
     
     // Sync to ensure all GPU operations complete
     cudaDeviceSynchronize();

@@ -34,6 +34,7 @@ float* ffn_postRMS_gamma_scaled_DEVICE = nullptr;
 float* vocabScores_DEVICE = nullptr;
 float* vocabScores_maxByCol_softmax_DEVICE = nullptr;
 float* vocabScores_sumByCol_softmax_DEVICE = nullptr;
+float* vocabScores_expfCache_softmax_DEVICE = nullptr;
 float* vocabScores_postSoftmax_DEVICE = nullptr;
 
 /*

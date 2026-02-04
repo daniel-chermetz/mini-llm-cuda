@@ -29,6 +29,7 @@ typedef struct {
     float* attnKtQByHeadScaledMasked;
     float* attnByHead_maxByCol_softmax;
     float* attnByHead_sumByCol_softmax;
+    float* attnByHead_expfCache_softmax;
     float* attnByHead_postSoftmax;
     float* valueScaledSoftmaxAttn;
     float* outputProj;
@@ -132,6 +133,7 @@ extern float* ffn_postRMS_post_gamma_DEVICE;
 extern float* vocabScores_DEVICE;
 extern float* vocabScores_maxByCol_softmax_DEVICE;
 extern float* vocabScores_sumByCol_softmax_DEVICE;
+extern float* vocabScores_expfCache_softmax_DEVICE;
 extern float* vocabScores_postSoftmax_DEVICE;
 
 /*
