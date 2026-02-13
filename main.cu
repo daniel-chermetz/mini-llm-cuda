@@ -105,9 +105,9 @@ int loadStoryContext(const char* storiesPath, int storyIndex, int percentage) {
     // Calculate context length based on percentage (minimum 1 token)
     int contextLength = (totalTokens * percentage) / 100;
     if (contextLength < 1) contextLength = 1;
-    if (contextLength > maxL) {
-        printf("Warning: Context length %d exceeds max sequence length maxL=%d, truncating.\n", contextLength, maxL);
-        contextLength = maxL;
+    if (contextLength > maxL + 1) {
+        printf("Warning: Context length %d exceeds max capacity (maxL+1=%d), truncating.\n", contextLength, maxL + 1);
+        contextLength = maxL + 1;
     }
     
     printf("Story has %d tokens, using %d tokens as context.\n", totalTokens, contextLength);

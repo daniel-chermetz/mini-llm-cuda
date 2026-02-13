@@ -298,21 +298,24 @@ int runGradientTests(void) {
     printf("  Context percent: %d%%\n", contextPercent);
     printf("\n");
     
-    // Step 1: Load story context (returns story length = L)
-    int L = loadStoryContext(storiesPath, storyIndex, contextPercent);
-    if (L <= 0) {
-        printf("Error: Failed to load story context.\n");
+    // Step 1: Load story context (returns token count, up to maxL+1)
+    int contextLength = loadStoryContext(storiesPath, storyIndex, contextPercent);
+    if (contextLength <= 1) {
+        printf("Error: Failed to load story context (need at least 2 tokens).\n");
         return 1;
     }
-    int rightSeqEndIndex = L - 1;  // Last token index
+    // L = number of inference positions; the token at index L is the target for the last prediction
+    int L = contextLength - 1;
+    int rightSeqEndIndex = L - 1;  // Last token index for inference
     
     printf("Story context loaded successfully.\n");
-    printf("  Story length (L): %d\n", L);
+    printf("  Tokens loaded (contextLength): %d\n", contextLength);
+    printf("  Inference positions (L): %d\n", L);
     printf("  rightSeqEndIndex: %d\n", rightSeqEndIndex);
     printf("\n");
     
-    // Step 2: Run inference
-    printf("Running inference...\n");
+    // Step 2: Run inference over L positions (0..L-1)
+    printf("Running inference on %d positions...\n", L);
     runInference(L);
     printf("Inference completed.\n\n");
     
@@ -479,13 +482,12 @@ int runGradientTests(void) {
         mkdir(GRADIENT_OUTPUT_DIR, 0755);
     }
     
-    // Save gradients only for the active region (positions 0..rightEndIndex)
-    int saveL = rightEndIndex + 1;
-    int saveSuccess = saveGlobalGradients(saveL);
+    // Save all L gradient positions (so we can verify positions beyond rightEndIndex are zero)
+    int saveSuccess = saveGlobalGradients(L);
     
     // Save gradients for each transformer
     for (int tIndex = 0; tIndex < transformers; tIndex++) {
-        saveSuccess &= saveTransformerGradients(tIndex, saveL);
+        saveSuccess &= saveTransformerGradients(tIndex, L);
     }
     
     printf("\n");

@@ -28,16 +28,18 @@ extern int loadStoryContext(const char* storiesPath, int storyIndex, int percent
 int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent,
                      bool skipUserInput, bool verboseOutput) {
     
-    // loadStoryContext now returns the story length (L = number of tokens loaded)
+    // loadStoryContext returns the number of tokens loaded (up to maxL+1).
+    // For free inference, L = the number of context tokens = inference positions to start with.
+    // We don't need the extra target token here — only teacher-forced training does.
     int L = loadStoryContext(storiesPath, storyIndex, contextPercent);
     if (L <= 0) {
         printf("Failed to load story context.\n");
         return 1;
     }
     
-    // Check if sequence is already at maxL
+    // If story filled to maxL or beyond, no room to generate
     if (L >= maxL) {
-        printf("Sequence already contains maxL=%d tokens. No generation needed.\n", maxL);
+        printf("Sequence already at maxL=%d tokens (loaded %d). No generation needed.\n", maxL, L);
         return 0;
     }
     
