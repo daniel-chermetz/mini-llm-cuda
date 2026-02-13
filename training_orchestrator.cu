@@ -33,7 +33,7 @@
 #define PRINT_EVERY_N_BATCHES 100
 
 // Save frequency: save model every N optimizer iterations (100k = 100000)
-#define SAVE_EVERY_N_ITERATIONS 100000
+#define SAVE_EVERY_N_ITERATIONS 30000
 
 // Model save path template (iteration number will be inserted)
 #define MODEL_SAVE_PATH "./model/weights_iter_%d.bin"
@@ -276,11 +276,17 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
 // SEQUENCE PROCESSING AND LOGGING
 // ============================================================================
 
-// Process a single sequence: run inference, log predictions, compute gradients
+// Return type for processSequence: total loss and prediction count
+typedef struct {
+    float totalLoss;
+    int numPredictions;
+} SequenceLossResult;
+
+// Process a single sequence: run inference, compute loss, compute gradients
 // storyIndex: index into the loaded stories (0-based)
 // shouldPrint: if true, print token-by-token predictions
-// Returns: sequence loss (average negative log likelihood)
-static float processSequence(int storyIndex, bool shouldPrint) {
+// Returns: total loss and number of predictions for this sequence
+static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
     // Get the rightEndIndex for this story (from host storage)
     int rightEndIndex = hostRightEndIndices_storage[storyIndex];
     int L = rightEndIndex + 1;  // Number of positions for inference (0..rightEndIndex)
@@ -298,21 +304,20 @@ static float processSequence(int storyIndex, bool shouldPrint) {
                (L + 1) * sizeof(int), 
                cudaMemcpyDeviceToDevice);
     
-    // Also copy to host seqTokenIndices for token display
-    cudaMemcpy(seqTokenIndices, 
-               trainingStoryTokens_DEVICE + storyOffset, 
-               (L + 1) * sizeof(int), 
-               cudaMemcpyDeviceToHost);
-    
     // Run forward pass (inference) over L positions
     runInference(L);
     
     float totalLoss = 0.0f;
-    int numPredictions = rightEndIndex + 1;  // Positions 0..rightEndIndex
-    float avgLoss = 0.0f;
+    int numPredictions = 0;
     
-    // Only print detailed predictions if shouldPrint is true
+    // Compute loss only when printing (avoids costly device-to-host copy every iteration)
     if (shouldPrint) {
+        // Copy token indices to host (needed for target lookup)
+        cudaMemcpy(seqTokenIndices, 
+                   trainingStoryTokens_DEVICE + storyOffset, 
+                   (L + 1) * sizeof(int), 
+                   cudaMemcpyDeviceToHost);
+        
         // Allocate softmax buffer if needed (allocated at maxL capacity)
         if (hostVocabSoftmax == nullptr) {
             hostVocabSoftmax = (float*)malloc(vocabSize * maxL * sizeof(float));
@@ -320,13 +325,7 @@ static float processSequence(int storyIndex, bool shouldPrint) {
         cudaMemcpy(hostVocabSoftmax, vocabScores_postSoftmax_DEVICE, 
                    vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
         
-        // ========================================================================
-        // Log predictions: token[i] --> token[i+1] (probability%)
-        // ========================================================================
         printf("\n--- Story %d Predictions (rightEndIndex = %d) ---\n", storyIndex, rightEndIndex);
-        
-        totalLoss = 0.0f;
-        numPredictions = 0;
         
         // For each position from 0 to rightEndIndex, we predict the next token
         for (int pos = 0; pos <= rightEndIndex; pos++) {
@@ -341,27 +340,21 @@ static float processSequence(int storyIndex, bool shouldPrint) {
             // Get softmax probability for the correct next token
             // vocabScores_postSoftmax is column-major: column 'pos' starts at pos * vocabSize
             float correctProb = hostVocabSoftmax[pos * vocabSize + nextTokenIdx];
-            
-            // Accumulate loss: -log(probability)
-            if (correctProb > 0.0f) {
-                totalLoss += -logf(correctProb);
-            } else {
-                totalLoss += 100.0f;  // Large penalty for zero probability
+            if (correctProb < 0.0001f) {
+                correctProb = 0.0001f;
             }
+            // Accumulate loss: -log(probability)
+            totalLoss += -logf(correctProb);
             numPredictions++;
             
-            // Get display tokens
             char currentTokenStr[64];
             char nextTokenStr[64];
             getDisplayToken(currentTokenIdx, currentTokenStr, sizeof(currentTokenStr));
             getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
-            
-            // Print: current --> next (probability%)
             printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
         }
         
-        // Calculate and print average loss
-        avgLoss = (numPredictions > 0) ? (totalLoss / numPredictions) : 0.0f;
+        float avgLoss = (numPredictions > 0) ? (totalLoss / numPredictions) : 0.0f;
         printf("\n--- Sequence Loss: %.4f (over %d predictions) ---\n", avgLoss, numPredictions);
     }
     
@@ -370,7 +363,10 @@ static float processSequence(int storyIndex, bool shouldPrint) {
     // ========================================================================
     getGradientsForTraining(leftStartIndex, rightEndIndex, L);
     
-    return avgLoss;
+    SequenceLossResult result;
+    result.totalLoss = totalLoss;
+    result.numPredictions = numPredictions;
+    return result;
 }
 
 // ============================================================================
@@ -400,6 +396,10 @@ int runTrainingLoop(void) {
     int fileIndex = 1;
     int totalStoriesProcessed = 0;
     int globalIterationCount = 0;  // Track total optimizer steps
+    
+    // Global cumulative loss tracking
+    double globalCumulativeLoss = 0.0;
+    long long globalCumulativePredictions = 0;
     
     // Iterate through all tokenizedStories_XXXX.json files
     while (true) {
@@ -458,7 +458,8 @@ int runTrainingLoop(void) {
                        batchIdx + 1, numBatches, batchStart, batchEnd - 1, globalIterationCount + 1);
             }
             
-            float batchTotalLoss = 0.0f;
+            double batchTotalLoss = 0.0;
+            int batchTotalPredictions = 0;
             
             // Inner loop: process each story in the batch
             for (int storyIdxInBatch = 0; storyIdxInBatch < currentBatchSize; storyIdxInBatch++) {
@@ -466,8 +467,9 @@ int runTrainingLoop(void) {
                 
                 // Process sequence: inference + gradient computation
                 // Only print if this is a print batch
-                float seqLoss = processSequence(globalStoryIdx, shouldPrintThisBatch);
-                batchTotalLoss += seqLoss;
+                SequenceLossResult seqResult = processSequence(globalStoryIdx, shouldPrintThisBatch);
+                batchTotalLoss += seqResult.totalLoss;
+                batchTotalPredictions += seqResult.numPredictions;
                 
                 // Accumulate gradients (reset on first item in batch)
                 bool isFirstInBatch = (storyIdxInBatch == 0);
@@ -477,15 +479,22 @@ int runTrainingLoop(void) {
                 // waitForKeypress();
             }
             
+            // Update global cumulative loss (sampled: only from printed batches)
+            if (shouldPrintThisBatch) {
+                globalCumulativeLoss += batchTotalLoss;
+                globalCumulativePredictions += batchTotalPredictions;
+            }
+            
             // Apply optimizer after batch gradient accumulation
             globalIterationCount++;
             float currentLR = getLearningRate(globalIterationCount);
             apply_adeamix_optimizer(globalIterationCount, currentLR);
             
             if (shouldPrintThisBatch) {
-                float batchAvgLoss = batchTotalLoss / currentBatchSize;
-                printf("\n==== Batch %d complete. Avg loss: %.4f | Optimizer step %d (lr=%.6f) ====\n", 
-                       batchIdx + 1, batchAvgLoss, globalIterationCount, currentLR);
+                float batchAvgLoss = (batchTotalPredictions > 0) ? (float)(batchTotalLoss / batchTotalPredictions) : 0.0f;
+                float globalAvgLoss = (globalCumulativePredictions > 0) ? (float)(globalCumulativeLoss / globalCumulativePredictions) : 0.0f;
+                printf("\n==== Batch %d complete | Batch loss: %.4f (%d preds) | Global loss: %.4f (%lld preds) | Iter %d (lr=%.6f) ====\n", 
+                       batchIdx + 1, batchAvgLoss, batchTotalPredictions, globalAvgLoss, globalCumulativePredictions, globalIterationCount, currentLR);
             }
             
             // Save model weights every SAVE_EVERY_N_ITERATIONS
@@ -500,6 +509,14 @@ int runTrainingLoop(void) {
         
         // Move to next file
         fileIndex++;
+    }
+    
+    // Final save if training produced work and last iteration wasn't already a save point
+    if (globalIterationCount > 0 && globalIterationCount % SAVE_EVERY_N_ITERATIONS != 0) {
+        char saveFilePath[256];
+        snprintf(saveFilePath, sizeof(saveFilePath), MODEL_SAVE_PATH, globalIterationCount);
+        printf("Saving final model weights at iteration %d...\n", globalIterationCount);
+        saveModelWeights(saveFilePath, globalIterationCount);
     }
     
     // Cleanup
