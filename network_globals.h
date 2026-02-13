@@ -191,11 +191,12 @@ extern float* beta3_pow_store;
 (on Device - for batch training)
 */
 
-// Storage for training stories: [MAX_TRAINING_STORIES x (L+1)] tokens
-// Each story has 257 tokens (padded with ~ if shorter)
+// Storage for training stories: [MAX_TRAINING_STORIES x (maxL + 1)] tokens
+// Each story has up to (maxL + 1) tokens (unused slots padded with ~)
 extern int* trainingStoryTokens_DEVICE;
 
-// Right end index for each story (0 to L-1, one before last true token)
+// Right end index for each story: last position from which a prediction can be made
+// For a story with N tokens (capped at maxL+1): rightEndIndex = min(N, maxL+1) - 2
 extern int* trainingStoryRightEndIndices_DEVICE;
 
 #ifdef __cplusplus

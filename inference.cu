@@ -446,7 +446,7 @@ int runInference(int L) {
         getAttnHeadsSumByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
         xTotalThreads = attnHeads * L * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
-        applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
+        applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, attnHeads, L);
 
         // V @ attnByHead_postSoftmax
         cublasGemmStridedBatchedEx(
@@ -643,7 +643,7 @@ int runInference(int L) {
     getVocabSumByCol_softmax<<<L, 256, sharedMemSize>>>(vocabScores_sumByCol_softmax_DEVICE, vocabScores_expfCache_softmax_DEVICE, vocabScores_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize);
     xTotalThreads = vocabSize * L;
     numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-    applySoftmaxToVocab<<<numBlocks, threadsPerBlock>>>(vocabScores_postSoftmax_DEVICE, vocabScores_expfCache_softmax_DEVICE, vocabScores_DEVICE, vocabScores_sumByCol_softmax_DEVICE, vocabScores_maxByCol_softmax_DEVICE, vocabSize, L);
+    applySoftmaxToVocab<<<numBlocks, threadsPerBlock>>>(vocabScores_postSoftmax_DEVICE, vocabScores_expfCache_softmax_DEVICE, vocabScores_sumByCol_softmax_DEVICE, vocabSize, L);
 
     return 0;
 }

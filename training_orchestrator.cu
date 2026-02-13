@@ -159,7 +159,7 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
     printf("Processing %d stories...\n", numStories);
     
     // Allocate host buffer for all stories' token indices and rightEndIndices
-    // Format: [story0_token0, story0_token1, ..., story0_token256, story1_token0, ...]
+    // Format: [story0_token0, story0_token1, ..., story0_tokenN, story1_token0, ...]
     int* hostTokenIndices = (int*)malloc(numStories * TOKENS_PER_STORY * sizeof(int));
     int* hostRightEndIndices = (int*)malloc(numStories * sizeof(int));
     
@@ -187,26 +187,27 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
             continue;
         }
         
-        // Calculate rightEndIndex:
-        // It's one index before the last true token (for prediction purposes)
-        // If story has < 257 tokens, rightEndIndex is (lastTrueTokenIdx - 1)
-        // rightEndIndex can never exceed 255 (L-1)
-        int lastTrueTokenIdx = (storyTokenCount > TOKENS_PER_STORY) 
-                              ? (TOKENS_PER_STORY - 1) 
-                              : (storyTokenCount - 1);
-        int rightEndIndex = lastTrueTokenIdx - 1;
-        if (rightEndIndex < 0) rightEndIndex = 0;  // Edge case: single-token story
-        if (rightEndIndex > L - 1) rightEndIndex = L - 1;  // Cannot exceed 255
+        // Calculate rightEndIndex: the last position from which a prediction can be made.
+        // We load up to TOKENS_PER_STORY (maxL+1) tokens. The token at rightEndIndex+1 is
+        // the target for the prediction at rightEndIndex.
+        // Example: 30-token story → load 30, rightEndIndex = 28, L = 29
+        // Example: 1000-token story (maxL=256) → load 257, rightEndIndex = 255, L = 256
+        int tokensToLoad = (storyTokenCount > TOKENS_PER_STORY) 
+                          ? TOKENS_PER_STORY 
+                          : storyTokenCount;
+        int rightEndIndex = tokensToLoad - 2;
+        if (rightEndIndex < 0) {
+            printf("Warning: Story at index %d has fewer than 2 tokens, skipping.\n", storyIdx);
+            continue;  // Need at least 2 tokens for one prediction
+        }
         
         hostRightEndIndices[storiesLoaded] = rightEndIndex;
         
         // Calculate base offset for this story in the token array
         int baseOffset = storiesLoaded * TOKENS_PER_STORY;
         
-        // Process tokens (first L+1 = 257 tokens)
-        int tokensToProcess = (storyTokenCount > TOKENS_PER_STORY) 
-                             ? TOKENS_PER_STORY 
-                             : storyTokenCount;
+        // Process tokens (up to tokensToLoad tokens)
+        int tokensToProcess = tokensToLoad;
         
         bool tokenError = false;
         for (int tokenPos = 0; tokenPos < tokensToProcess && !tokenError; tokenPos++) {
@@ -249,8 +250,8 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
                    storiesLoaded * TOKENS_PER_STORY * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(trainingStoryRightEndIndices_DEVICE, hostRightEndIndices,
                    storiesLoaded * sizeof(int), cudaMemcpyHostToDevice);
-        printf("Copied %d stories (%d tokens) to GPU memory.\n", 
-               storiesLoaded, storiesLoaded * TOKENS_PER_STORY);
+        printf("Copied %d stories to GPU memory (slot size = %d tokens).\n", 
+               storiesLoaded, TOKENS_PER_STORY);
     }
     
     // Cleanup token indices (no longer needed on host)
@@ -282,39 +283,39 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
 static float processSequence(int storyIndex, bool shouldPrint) {
     // Get the rightEndIndex for this story (from host storage)
     int rightEndIndex = hostRightEndIndices_storage[storyIndex];
+    int L = rightEndIndex + 1;  // Number of positions for inference (0..rightEndIndex)
     int leftStartIndex = 0;
     
     // Calculate offset into trainingStoryTokens_DEVICE for this story
-    // Each story has TOKENS_PER_STORY (257) tokens
+    // Each story slot has TOKENS_PER_STORY (maxL+1) entries
     int storyOffset = storyIndex * TOKENS_PER_STORY;
     
-    // Copy this story's first L tokens to seqTokenIndices_DEVICE
-    // (The inference uses L=256 positions, tokens 0..255)
-    // Token at index 256 is only used as the target for position 255
-    // check here about 257 <--- Daniel
+    // Copy this story's L+1 tokens to seqTokenIndices_DEVICE
+    // Inference processes L positions (0..L-1 = 0..rightEndIndex)
+    // Token at index L (= rightEndIndex+1) is the target for position rightEndIndex
     cudaMemcpy(seqTokenIndices_DEVICE, 
                trainingStoryTokens_DEVICE + storyOffset, 
-               TOKENS_PER_STORY * sizeof(int), 
+               (L + 1) * sizeof(int), 
                cudaMemcpyDeviceToDevice);
     
     // Also copy to host seqTokenIndices for token display
     cudaMemcpy(seqTokenIndices, 
                trainingStoryTokens_DEVICE + storyOffset, 
-               TOKENS_PER_STORY * sizeof(int), 
+               (L + 1) * sizeof(int), 
                cudaMemcpyDeviceToHost);
     
-    // Run forward pass (inference)
-    runInference();
+    // Run forward pass (inference) over L positions
+    runInference(L);
     
     float totalLoss = 0.0f;
-    int numPredictions = rightEndIndex + 1;  // Approximate for gradient calc
+    int numPredictions = rightEndIndex + 1;  // Positions 0..rightEndIndex
     float avgLoss = 0.0f;
     
     // Only print detailed predictions if shouldPrint is true
     if (shouldPrint) {
-        // Allocate softmax buffer if needed
+        // Allocate softmax buffer if needed (allocated at maxL capacity)
         if (hostVocabSoftmax == nullptr) {
-            hostVocabSoftmax = (float*)malloc(vocabSize * L * sizeof(float));
+            hostVocabSoftmax = (float*)malloc(vocabSize * maxL * sizeof(float));
         }
         cudaMemcpy(hostVocabSoftmax, vocabScores_postSoftmax_DEVICE, 
                    vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
@@ -367,7 +368,7 @@ static float processSequence(int storyIndex, bool shouldPrint) {
     // ========================================================================
     // Compute gradients for backpropagation
     // ========================================================================
-    getGradientsForTraining(leftStartIndex, rightEndIndex, L); // L needs to be figured out from the sequence
+    getGradientsForTraining(leftStartIndex, rightEndIndex, L);
     
     return avgLoss;
 }

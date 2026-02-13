@@ -105,9 +105,9 @@ int loadStoryContext(const char* storiesPath, int storyIndex, int percentage) {
     // Calculate context length based on percentage (minimum 1 token)
     int contextLength = (totalTokens * percentage) / 100;
     if (contextLength < 1) contextLength = 1;
-    if (contextLength > L) {
-        printf("Warning: Context length %d exceeds max sequence length L=%d, truncating.\n", contextLength, L);
-        contextLength = L;
+    if (contextLength > maxL) {
+        printf("Warning: Context length %d exceeds max sequence length maxL=%d, truncating.\n", contextLength, maxL);
+        contextLength = maxL;
     }
     
     printf("Story has %d tokens, using %d tokens as context.\n", totalTokens, contextLength);
@@ -154,21 +154,16 @@ int loadStoryContext(const char* storiesPath, int storyIndex, int percentage) {
         return 0;
     }
     
-    // Pad remaining positions with token index 5 ("?") if context is shorter than L
-    for (int i = contextLength; i < L; i++) {
-        seqTokenIndices[i] = 5;  // Padding token
-    }
+    // Copy to device (only the actual context tokens, no padding needed)
+    cudaMemcpy(seqTokenIndices_DEVICE, seqTokenIndices, contextLength * sizeof(int), cudaMemcpyHostToDevice);
     
-    // Copy to device
-    cudaMemcpy(seqTokenIndices_DEVICE, seqTokenIndices, L * sizeof(int), cudaMemcpyHostToDevice);
-    
-    printf("Set %d context tokens in seqTokenIndices (padded to L=%d with token 5).\n", contextLength, L);
+    printf("Set %d context tokens in seqTokenIndices (story length L=%d).\n", contextLength, contextLength);
     printf("--- Story context loaded successfully. ---\n\n");
     
     cJSON_Delete(root);
     free(jsonContent);
     
-    return contextLength - 1;  // Return rightSeqEndIndex (last real token index)
+    return contextLength;  // Return story length (L)
 }
 
 int main(int argc, char* argv[]) {

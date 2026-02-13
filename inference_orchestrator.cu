@@ -28,20 +28,21 @@ extern int loadStoryContext(const char* storiesPath, int storyIndex, int percent
 int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent,
                      bool skipUserInput, bool verboseOutput) {
     
-    int rightSeqEndIndex = loadStoryContext(storiesPath, storyIndex, contextPercent);
-    if (rightSeqEndIndex < 0) {
+    // loadStoryContext now returns the story length (L = number of tokens loaded)
+    int L = loadStoryContext(storiesPath, storyIndex, contextPercent);
+    if (L <= 0) {
         printf("Failed to load story context.\n");
         return 1;
     }
     
-    // Check if sequence is already full (L tokens)
-    if (rightSeqEndIndex >= L) {
-        printf("Sequence already contains L=%d tokens. No generation needed.\n", L+1);
+    // Check if sequence is already at maxL
+    if (L >= maxL) {
+        printf("Sequence already contains maxL=%d tokens. No generation needed.\n", maxL);
         return 0;
     }
     
-    // Allocate host memory for vocabulary scores
-    float* vocabScores_postSoftmax = (float*)malloc(vocabSize * L * sizeof(float));
+    // Allocate host memory for vocabulary scores (allocated at maxL capacity)
+    float* vocabScores_postSoftmax = (float*)malloc(vocabSize * maxL * sizeof(float));
     if (!vocabScores_postSoftmax) {
         printf("Error: Failed to allocate memory for vocabulary scores.\n");
         return 1;
@@ -49,7 +50,7 @@ int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent
     
     // Generation loop
     int tokensGenerated = 0;
-    int maxTokensToGenerate = (L + 1) - (rightSeqEndIndex + 1);  // How many tokens until we hit L total
+    int maxTokensToGenerate = maxL - L;
     
     printf("\n========================================\n");
     printf("Starting text generation (max %d new tokens)\n", maxTokensToGenerate);
@@ -58,17 +59,17 @@ int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent
     
     auto start = std::chrono::high_resolution_clock::now();
 
-    while (rightSeqEndIndex <= L - 1) {
-        runInference();
+    while (L < maxL) {
+        runInference(L); // LOAD STORY CONTEXT REPORTED L TOKENS, THIS MUST RUN INFERENCE ON index L-1, TO PREDICT index L
         
-        // Copy vocabulary scores from device to host
+        // Copy vocabulary scores from device to host (only the L columns we need)
         cudaMemcpy(vocabScores_postSoftmax, vocabScores_postSoftmax_DEVICE, 
                    vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
         
-        // Calculate offset for the prediction position
+        // Calculate offset for the prediction position (last token = L-1)
         // vocabScores_postSoftmax is column-major: [vocabSize x L]
-        // For position rightSeqEndIndex, we want column rightSeqEndIndex
-        size_t offset = rightSeqEndIndex * vocabSize;
+        // For position L-1 (last token), we want column L-1
+        size_t offset = (L - 1) * vocabSize;
         
         // Create array of token probabilities for sorting
         TokenProb* tokenProbs = (TokenProb*)malloc(vocabSize * sizeof(TokenProb));
@@ -82,7 +83,7 @@ int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent
 
         if (verboseOutput) {        
             // Display top-10 most probable tokens
-            printf("\n--- Top 10 Most Probable Next Tokens (position %d) ---\n", rightSeqEndIndex + 1);
+            printf("\n--- Top 10 Most Probable Next Tokens (position %d) ---\n", L);
             for (int i = 0; i < 10 && i < vocabSize; i++) {
                 const char* tokenStr = vocabGetToken(tokenProbs[i].tokenIdx);
                 if (tokenStr) {
@@ -142,17 +143,17 @@ int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent
             }
         }
         
-        // Append the token to the sequence
-        rightSeqEndIndex++;
-        seqTokenIndices[rightSeqEndIndex] = nextTokenIdx;
+        // Append the token to the sequence at position L, then grow L
+        seqTokenIndices[L] = nextTokenIdx;
+        L++;
         tokensGenerated++;
         
-        // Update the device memory with the new sequence
+        // Update the device memory with the new sequence (L tokens)
         cudaMemcpy(seqTokenIndices_DEVICE, seqTokenIndices, L * sizeof(int), cudaMemcpyHostToDevice);
 
         if (verboseOutput) {        
             printf("\n[Token added. Total context: %d tokens, generated: %d]\n", 
-                   rightSeqEndIndex + 1, tokensGenerated);
+                   L, tokensGenerated);
         }
     }
 
@@ -162,12 +163,12 @@ int runInferenceLoop(const char* storiesPath, int storyIndex, int contextPercent
     
     printf("\n========================================\n");
     printf("Generation complete. Generated %d new tokens.\n", tokensGenerated);
-    printf("Final sequence length: %d tokens\n", rightSeqEndIndex + 1);
+    printf("Final sequence length: %d tokens\n", L);
     printf("========================================\n\n");
     
     // Display final generated sequence
     printf("=== Final Generated Sequence ===\n");
-    for (int i = 0; i <= rightSeqEndIndex; i++) {
+    for (int i = 0; i < L; i++) {
         const char* token = vocabGetToken(seqTokenIndices[i]);
         if (token) {
             if (strcmp(token, "\n") == 0) {

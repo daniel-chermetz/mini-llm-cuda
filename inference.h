@@ -1,4 +1,4 @@
 #pragma once
 
-int runInference(void);
+int runInference(int L);
 void getPreComputedRopeTheta(float* preComputedRopeTheta, int maxL_);

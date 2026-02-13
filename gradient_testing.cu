@@ -120,7 +120,7 @@ static int saveGradientToJSON(float* devicePtr, size_t numElements, const char* 
 }
 
 // Save all gradients from backpropCalculations for a specific transformer index
-static int saveTransformerGradients(int tIndex) {
+static int saveTransformerGradients(int tIndex, int L) {
     char filename[256];
     int success = 1;
     
@@ -261,7 +261,7 @@ static int saveTransformerGradients(int tIndex) {
 }
 
 // Save all global gradients (not per-transformer)
-static int saveGlobalGradients(void) {
+static int saveGlobalGradients(int L) {
     int success = 1;
     
     printf("Saving global gradients...\n");
@@ -298,20 +298,22 @@ int runGradientTests(void) {
     printf("  Context percent: %d%%\n", contextPercent);
     printf("\n");
     
-    // Step 1: Load story context
-    int rightSeqEndIndex = loadStoryContext(storiesPath, storyIndex, contextPercent);
-    if (rightSeqEndIndex < 0) {
+    // Step 1: Load story context (returns story length = L)
+    int L = loadStoryContext(storiesPath, storyIndex, contextPercent);
+    if (L <= 0) {
         printf("Error: Failed to load story context.\n");
         return 1;
     }
+    int rightSeqEndIndex = L - 1;  // Last token index
     
     printf("Story context loaded successfully.\n");
+    printf("  Story length (L): %d\n", L);
     printf("  rightSeqEndIndex: %d\n", rightSeqEndIndex);
     printf("\n");
     
     // Step 2: Run inference
     printf("Running inference...\n");
-    runInference();
+    runInference(L);
     printf("Inference completed.\n\n");
     
     // Step 3: Copy vocabulary scores from device to host
@@ -455,7 +457,7 @@ int runGradientTests(void) {
     printf("  rightEndIndex: %d\n", rightEndIndex);
     printf("\n");
     
-    getGradientsForTraining(leftStartIndex, rightEndIndex, L); // L needs to be figuted out from the sequence
+    getGradientsForTraining(leftStartIndex, rightEndIndex, L);
     
     // Sync to ensure all GPU operations complete
     cudaDeviceSynchronize();
@@ -477,12 +479,13 @@ int runGradientTests(void) {
         mkdir(GRADIENT_OUTPUT_DIR, 0755);
     }
     
-    // Save global gradients
-    int saveSuccess = saveGlobalGradients();
+    // Save gradients only for the active region (positions 0..rightEndIndex)
+    int saveL = rightEndIndex + 1;
+    int saveSuccess = saveGlobalGradients(saveL);
     
     // Save gradients for each transformer
     for (int tIndex = 0; tIndex < transformers; tIndex++) {
-        saveSuccess &= saveTransformerGradients(tIndex);
+        saveSuccess &= saveTransformerGradients(tIndex, saveL);
     }
     
     printf("\n");

@@ -92,7 +92,7 @@ float* beta3_pow_store = nullptr;
 (on Device - for batch training)
 */
 
-// Storage for training stories: [MAX_TRAINING_STORIES x (L+1)] tokens
+// Storage for training stories: [MAX_TRAINING_STORIES x (maxL + 1)] tokens
 int* trainingStoryTokens_DEVICE = nullptr;
 
 // Right end index for each story
