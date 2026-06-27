@@ -27,7 +27,7 @@ __global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_) {
 
     int colOffset = colIndex * dim_;
 
-    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2    
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2
 
     float threadSum = 0.0f;
     for (int rowIndex = tIndex; rowIndex < dim_; rowIndex += blockDim.x) {
@@ -45,7 +45,38 @@ __global__ void getRMSColSums(float* rmsSumByCol, float* x, int dim_) {
     }
 
     if (tIndex == 0) {
-        rmsSumByCol[colIndex] = sqrtf((sData[0] / dim_) + 1e-8);
+        rmsSumByCol[colIndex] = sqrtf((sData[0] / dim_) + 1e-8f);
+    }
+}
+
+__global__ void getRMSColSumsAcrossHeads(float* rmsSumByColByHead, float* x) {
+    int colIndex = blockIdx.x;
+    int headIndex = blockIdx.y;
+    int tIndex = threadIdx.x; // enforce blockDim no bigger than headDim_
+
+    int colOffset = colIndex * dim;
+    int headOffset = headIndex * headDim;
+    int headEnd = (headIndex + 1) * headDim;
+
+    extern __shared__ float sData[]; // blockDim.x from host invocation; must be a power of 2
+
+    float threadSum = 0.0f;
+    for (int rowIndex = (headOffset + tIndex); rowIndex < headEnd; rowIndex += blockDim.x) {
+        float val = x[colOffset + rowIndex];
+        threadSum += (val * val);
+    }
+    sData[tIndex] = threadSum;
+    __syncthreads();
+
+    for (int reductionSize = blockDim.x / 2; reductionSize > 0; reductionSize /= 2) {
+        if (tIndex < reductionSize) {
+            sData[tIndex] = sData[tIndex] + sData[tIndex + reductionSize];
+        }
+        __syncthreads();
+    }
+
+    if (tIndex == 0) {
+        rmsSumByColByHead[attnHeads * colIndex + headIndex] = sqrtf((sData[0] / headDim) + 1e-8f);
     }
 }
 
@@ -60,6 +91,22 @@ __global__ void applyRMSNorm(float* postRMS_post_gamma, float* postRMS_pre_gamma
     int colIndex = index / dim_;
     int rowIndex = index - colIndex * dim_;
     postRMS_pre_gamma[index] = (preRMS[index] / rmsSumByCol[colIndex]);
+    postRMS_post_gamma[index] = (rms_weights[rowIndex] * postRMS_pre_gamma[index]);
+}
+
+__global__ void applyRMSNormAcrossHeads(float* postRMS_post_gamma, float* postRMS_pre_gamma, float* preRMS, float* rmsSumByColByHead, float* rms_weights, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxCount = dim * L_;
+    if (index >= maxCount) {
+        return;
+    }
+
+    int colIndex = index / dim;
+    int rowIndex = index - colIndex * dim;
+    int headIndex = rowIndex / headDim;
+    int sumIndex = attnHeads * colIndex + headIndex;
+
+    postRMS_pre_gamma[index] = (preRMS[index] / rmsSumByColByHead[sumIndex]);
     postRMS_post_gamma[index] = (rms_weights[rowIndex] * postRMS_pre_gamma[index]);
 }
 
@@ -191,6 +238,17 @@ __global__ void applySoftmaxToAttnHeads(float* attnByHead_postSoftmax, float* ex
     attnByHead_postSoftmax[index] = 0;    
 }
 
+__global__ void applyGatingToValueScaledAttnPostSoftmax(float* gatedValueScaledSoftmaxAttn, float* valueScaledSoftmaxAttn, float* gatedQueriesPostSigmoid, float* gatedQueries, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxCount = dim * L_;
+    if (index >= maxCount) {
+        return;
+    }
+
+    gatedQueriesPostSigmoid[index] = 1.0f / (1.0f + expf(-gatedQueries[index]));
+    gatedValueScaledSoftmaxAttn[index] = valueScaledSoftmaxAttn[index] * gatedQueriesPostSigmoid[index];
+}
+
 __global__ void addResidualToOutputProj(float* outputProjPlusResidual, float* outputProj, float* xFromTransformerStart, int dim_, int L_) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int maxIndex = dim_ * L_ - 1;
@@ -319,6 +377,7 @@ int runInference(int L) {
     int xTotalThreads = L * dim;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
     size_t sharedMemSize = 256 * sizeof(float);
+    size_t sharedMemSize_head = 64 * sizeof(float);
 
     setInputSeqEmbeddings<<<numBlocks, threadsPerBlock>>>(x_DEVICE, seqTokenIndices_DEVICE, embedding_weights_DEVICE, dim, L);
 
@@ -405,10 +464,48 @@ int runInference(int L) {
             CUBLAS_GEMM_DEFAULT             
         );
 
+        if (CONFIG_QK_RMS_NORM) {
+            dim3 qkRMSGridDim(L, attnHeads);
+            getRMSColSumsAcrossHeads<<<qkRMSGridDim, 64, sharedMemSize_head>>>(transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead, transformerCalculations_DEVICE[tIndex].queries);
+            getRMSColSumsAcrossHeads<<<qkRMSGridDim, 64, sharedMemSize_head>>>(transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead, transformerCalculations_DEVICE[tIndex].keys);
+
+            applyRMSNormAcrossHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma, transformerCalculations_DEVICE[tIndex].queries_post_RMS_pre_gamma, transformerCalculations_DEVICE[tIndex].queries, transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead, transformerWeights_DEVICE[tIndex].queries_RMS_weights, L);
+            applyRMSNormAcrossHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma, transformerCalculations_DEVICE[tIndex].keys_post_RMS_pre_gamma, transformerCalculations_DEVICE[tIndex].keys, transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead, transformerWeights_DEVICE[tIndex].keys_RMS_weights, L);
+        }
+
         xTotalThreads = dimPairs * L;
-        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;   
-        applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
-        applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
+        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+        if (CONFIG_QK_RMS_NORM) {
+            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma, preComputedRopeTheta_DEVICE, headDim, dim, L);
+            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma, preComputedRopeTheta_DEVICE, headDim, dim, L);
+        } else {
+            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
+            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
+        }
+
+        if (CONFIG_QUERY_GATING) {
+            cublasGemmEx(
+                handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                dim, // row C
+                L, // cols C
+                dim, // contracting (shared) dim
+                &alpha,
+                transformerWeights_DEVICE[tIndex].gated_query_weights,
+                CUDA_R_32F,
+                dim, // lda, mem col size for col-major
+                transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
+                CUDA_R_32F,
+                dim, // ldb, mem col size for col-major
+                &beta,
+                transformerCalculations_DEVICE[tIndex].gatedQueries,
+                CUDA_R_32F,
+                dim, // ldc, mem col size
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT
+            );
+        }
 
         // K.t @ Q
         cublasGemmStridedBatchedEx(
@@ -475,6 +572,12 @@ int runInference(int L) {
             CUBLAS_GEMM_DEFAULT
         );
 
+        if (CONFIG_QUERY_GATING) {
+            xTotalThreads = dim * L;
+            numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+            applyGatingToValueScaledAttnPostSoftmax<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].gatedValueScaledSoftmaxAttn, transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn, transformerCalculations_DEVICE[tIndex].gatedQueriesPostSigmoid, transformerCalculations_DEVICE[tIndex].gatedQueries, L);
+        }
+
         // output_proj_weights @ valueScaledSoftmaxAttn (heads already fused to dim sized cols)
         cublasGemmEx(
             handle,
@@ -487,7 +590,7 @@ int runInference(int L) {
             transformerWeights_DEVICE[tIndex].output_proj_weights,
             CUDA_R_32F,
             dim, // lda, col size in mem for col-major
-            transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn,
+            (CONFIG_QUERY_GATING ? transformerCalculations_DEVICE[tIndex].gatedValueScaledSoftmaxAttn : transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn),
             CUDA_R_32F,
             dim, // ldb, col size in mem for col-major
             &beta,
