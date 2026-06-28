@@ -12,7 +12,7 @@
 #include <dirent.h>
 #include <unistd.h>
 
-#include "cJSON.h"
+#include "cJSON/cJSON.h"
 #include "network_meta.h"
 #include "network_globals.h"
 #include "load_model.h"
@@ -30,13 +30,13 @@
 #define TOKENIZED_STORIES_PATH "./tokenizedStories"
 
 // Printing frequency: print every N batches (set to 1 to print all)
-#define PRINT_EVERY_N_BATCHES 100
+#define PRINT_EVERY_N_BATCHES 20
 
 // Save frequency: save model every N optimizer iterations (100k = 100000)
-#define SAVE_EVERY_N_ITERATIONS 30000
+#define SAVE_EVERY_N_ITERATIONS 20000
 
 // Model save path template (iteration number will be inserted)
-#define MODEL_SAVE_PATH "./model/weights_iter_%d.bin"
+#define MODEL_SAVE_PATH "./model/victorian_weights_iter_%d.bin"
 
 // ============================================================================
 // MODULE-LEVEL STORAGE
@@ -374,9 +374,9 @@ static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
 // ============================================================================
 
 // Learning rate warmup configuration
-#define LR_START 1e-5f        // Starting learning rate
-#define LR_END 9e-5f          // Final learning rate after warmup
-#define LR_WARMUP_STEPS 20000 // Number of iterations for warmup
+#define LR_START 9e-6f        // Starting learning rate
+#define LR_END 1e-4f          // Final learning rate after warmup
+#define LR_WARMUP_STEPS 10000 // Number of iterations for warmup
 
 // Calculate learning rate with linear warmup
 static float getLearningRate(int iteration) {
@@ -503,6 +503,11 @@ int runTrainingLoop(void) {
                 snprintf(saveFilePath, sizeof(saveFilePath), MODEL_SAVE_PATH, globalIterationCount);
                 saveModelWeights(saveFilePath, globalIterationCount);
             }
+            /*if (globalIterationCount > 0 && globalIterationCount % 50 == 0) {
+                // Rest period after every 50 batches to let GPU cool down
+                printf("Resting for 13 seconds...\n");
+                sleep(13);
+            }*/
         }
         
         printf("Finished processing file %d.\n\n", fileIndex);
