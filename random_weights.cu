@@ -89,6 +89,21 @@ void initializeRandomWeights(float range) {
         // FFN right 2 weights (ffnDim x dim)
         initRandomWeights<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].ffn_right_2_weights, size, range, seed++);
         
+        // CONFIG_QK_RMS_NORM: query/key RMS gamma weights (dim) - initialize to 1.0
+        if (CONFIG_QK_RMS_NORM) {
+            size = dim;
+            numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+            initConstantWeights<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].query_RMS_weights, size, 1.0f);
+            initConstantWeights<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].key_RMS_weights, size, 1.0f);
+        }
+        
+        // CONFIG_QUERY_GATING: gated query weights (dim x dim)
+        if (CONFIG_QUERY_GATING) {
+            size = dim * dim;
+            numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+            initRandomWeights<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].gated_query_weights, size, range, seed++);
+        }
+        
         printf("  Transformer %d weights initialized\n", t);
     }
     

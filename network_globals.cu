@@ -29,7 +29,6 @@ TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
 float* ffn_sumByCol_RMS_DEVICE = nullptr;
 float* ffn_postRMS_pre_gamma_DEVICE = nullptr;
 float* ffn_postRMS_post_gamma_DEVICE = nullptr;
-float* ffn_postRMS_gamma_scaled_DEVICE = nullptr;
 
 float* vocabScores_DEVICE = nullptr;
 float* vocabScores_maxByCol_softmax_DEVICE = nullptr;

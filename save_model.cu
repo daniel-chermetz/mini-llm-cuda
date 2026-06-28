@@ -55,6 +55,13 @@ void saveModelWeights(const char* filename, int iterationNum) {
         totalElements += ffnDim * dim;  // feedForwardWeights1A (ffn_right_1)
         totalElements += ffnDim * dim;  // feedForwardWeights1B (ffn_right_2)
         totalElements += dim * ffnDim;  // feedForwardWeights2 (ffn_left)
+        if (CONFIG_QK_RMS_NORM) {
+            totalElements += dim;       // queryRMSGamma
+            totalElements += dim;       // keyRMSGamma
+        }
+        if (CONFIG_QUERY_GATING) {
+            totalElements += dim * dim; // gatedQueryWeights
+        }
     }
     
     // Allocate host buffer for all weights
@@ -115,6 +122,19 @@ void saveModelWeights(const char* filename, int iterationNum) {
         // feedForwardWeights2 = ffn_left (dim x ffnDim)
         shape2D[0] = dim; shape2D[1] = ffnDim;
         offset += addTensorToSave(blockMeta, "feedForwardWeights2", transformerWeights_DEVICE[t].ffn_left_weights, shape2D, 2, hostBuffer, offset);
+        
+        // CONFIG_QK_RMS_NORM: query/key RMS gamma (dim)
+        if (CONFIG_QK_RMS_NORM) {
+            shape1D[0] = dim;
+            offset += addTensorToSave(blockMeta, "queryRMSGamma", transformerWeights_DEVICE[t].query_RMS_weights, shape1D, 1, hostBuffer, offset);
+            offset += addTensorToSave(blockMeta, "keyRMSGamma", transformerWeights_DEVICE[t].key_RMS_weights, shape1D, 1, hostBuffer, offset);
+        }
+        
+        // CONFIG_QUERY_GATING: gated query weights (dim x dim)
+        if (CONFIG_QUERY_GATING) {
+            shape2D[0] = dim; shape2D[1] = dim;
+            offset += addTensorToSave(blockMeta, "gatedQueryWeights", transformerWeights_DEVICE[t].gated_query_weights, shape2D, 2, hostBuffer, offset);
+        }
         
         cJSON_AddItemToArray(transformerBlocks, blockMeta);
     }

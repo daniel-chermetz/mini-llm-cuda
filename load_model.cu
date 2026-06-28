@@ -437,6 +437,33 @@ int loadModel(const char* modelName) {
                     printf("Warning: Weight '%s' not found in block %d\n", weightMap[w].jsonKey, blockIdx);
                 }
             }
+            
+            // Config-guarded weights (must be read in the same order they were saved)
+            struct { const char* jsonKey; float* hostPtr; float** devicePtr; } configWeightMap[3];
+            int numConfigWeights = 0;
+            if (CONFIG_QK_RMS_NORM) {
+                configWeightMap[numConfigWeights++] = {"queryRMSGamma", tw->query_RMS_weights, &tw_d->query_RMS_weights};
+                configWeightMap[numConfigWeights++] = {"keyRMSGamma", tw->key_RMS_weights, &tw_d->key_RMS_weights};
+            }
+            if (CONFIG_QUERY_GATING) {
+                configWeightMap[numConfigWeights++] = {"gatedQueryWeights", tw->gated_query_weights, &tw_d->gated_query_weights};
+            }
+            
+            for (int w = 0; w < numConfigWeights && success; w++) {
+                cJSON* weightObj = cJSON_GetObjectItem(blockObj, configWeightMap[w].jsonKey);
+                if (weightObj) {
+                    if (parseTensorMeta(weightObj, &tensorMeta)) {
+                        if (!readTensorColumnMajor(fileBuffer, &dataOffset, fileSize, &tensorMeta, configWeightMap[w].hostPtr)) {
+                            success = 0;
+                        } else {
+                            cudaMemcpy(*configWeightMap[w].devicePtr, configWeightMap[w].hostPtr, 
+                                      tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
+                        }
+                    }
+                } else {
+                    printf("Warning: Weight '%s' not found in block %d\n", configWeightMap[w].jsonKey, blockIdx);
+                }
+            }
         }
     }
     
