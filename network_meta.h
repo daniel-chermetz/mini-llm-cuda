@@ -1,17 +1,17 @@
 #pragma once
 
-#define dim 512
-#define dimPairs 256
-#define attnHeads 4 
+#define dim 768
+#define dimPairs 384
+#define attnHeads 6
 #define headDim 128
 #define ropeDenomBase 10000
 #define ffnDimMultiplier 4
-#define ffnDim 2048
-#define transformers 8
+#define ffnDim 3072
+#define transformers 16
 #define maxL 1280
-#define vocabSize 10096
+#define vocabSize 20160
 
-#define TRAINING_BATCH_SIZE 4
+#define TRAINING_BATCH_SIZE 8
 
 // AdEMAMix optimizer hyperparameters
 #define ADEAMIX_BETA1 0.9f        // Fast EMA decay (like Adam's beta1)
