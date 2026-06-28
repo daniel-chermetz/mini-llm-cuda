@@ -114,7 +114,7 @@ __global__ void preCalcRMSColWideVals_acrossHeads(
 	float* x_sumByCol_RMS_byHead,
 	float* gamma_weights_RMS,
 	float* upstream_grad,
-	int L_,
+	int L_
 ) {
     int colIndex = blockIdx.x;
     int headIndex = blockIdx.y;
@@ -139,7 +139,7 @@ __global__ void dLoss_dPreRMSNorm_acrossHeads(
 	float* oneOverR_byCol_RMS_byHead,
 	float* oneOverHeadDimR3_byCol_RMS_byHead,
 	float* gamma_weights_RMS,
-	float* upstream_grad,
+	float* upstream_grad
 ) {
 	int colIndex = blockIdx.x; // L: 1280 at the most
 	int headIndex = blockIdx.y; // attnHeads: 16 at the most
@@ -1208,6 +1208,14 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			cudaMemcpy(gradientAccumulation[transformerIndex].query_weights, backpropCalculations[transformerIndex].query_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
 			cudaMemcpy(gradientAccumulation[transformerIndex].key_weights, backpropCalculations[transformerIndex].key_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
 			cudaMemcpy(gradientAccumulation[transformerIndex].rms1_gamma_weights, backpropCalculations[transformerIndex].rms1_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+
+			if (CONFIG_QK_RMS_NORM) {
+				cudaMemcpy(gradientAccumulation[transformerIndex].queries_gamma_weights, backpropCalculations[transformerIndex].queries_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+				cudaMemcpy(gradientAccumulation[transformerIndex].keys_gamma_weights, backpropCalculations[transformerIndex].keys_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+			}
+			if (CONFIG_QUERY_GATING) {
+				cudaMemcpy(gradientAccumulation[transformerIndex].gated_query_weights, backpropCalculations[transformerIndex].gated_query_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+			}
     	}
 	} else {
 		int xTotalThreads = dim * vocabSize;
@@ -1231,12 +1239,18 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].value_weights, backpropCalculations[transformerIndex].value_weights, dim * dim);
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].query_weights, backpropCalculations[transformerIndex].query_weights, dim * dim);
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].key_weights, backpropCalculations[transformerIndex].key_weights, dim * dim);
+			if (CONFIG_QUERY_GATING) {
+				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].gated_query_weights, backpropCalculations[transformerIndex].gated_query_weights, dim * dim);
+			}
 
 			xTotalThreads = dim;
 			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].rms1_gamma_weights, backpropCalculations[transformerIndex].rms1_gamma_weights, dim);
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].rms2_gamma_weights, backpropCalculations[transformerIndex].rms2_gamma_weights, dim);
-
-		}		
+			if (CONFIG_QK_RMS_NORM) {
+				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].keys_gamma_weights, backpropCalculations[transformerIndex].keys_gamma_weights, dim);
+				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].queries_gamma_weights, backpropCalculations[transformerIndex].queries_gamma_weights, dim);
+			}
+		}
 	}
 }
