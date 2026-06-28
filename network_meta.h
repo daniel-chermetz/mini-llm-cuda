@@ -13,6 +13,12 @@
 
 #define TRAINING_BATCH_SIZE 8
 
+// Architecture configuration flags
+// The preprocessor substitutes these with the literal true/false at compile time,
+// so the corresponding branches are selected (and the other branch optimized out).
+#define CONFIG_QK_RMS_NORM true   // Apply RMS norm to queries/keys (per head) before RoPE
+#define CONFIG_QUERY_GATING true  // Sigmoid-gate the attention output using a learned query projection
+
 // AdEMAMix optimizer hyperparameters
 #define ADEAMIX_BETA1 0.9f        // Fast EMA decay (like Adam's beta1)
 #define ADEAMIX_BETA2 0.999f      // Variance EMA decay (like Adam's beta2)

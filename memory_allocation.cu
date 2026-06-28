@@ -28,6 +28,14 @@ static void allocateBatchGradAccumulationMemory() {
         cudaMalloc((void**)&gradientAccumulation[transformerIndex].query_weights, dim * dim * sizeof(float));
         cudaMalloc((void**)&gradientAccumulation[transformerIndex].key_weights, dim * dim * sizeof(float));
         cudaMalloc((void**)&gradientAccumulation[transformerIndex].rms1_gamma_weights, dim * sizeof(float));
+
+        if (CONFIG_QK_RMS_NORM) {
+            cudaMalloc((void**)&gradientAccumulation[transformerIndex].query_gamma_weights, dim * sizeof(float));
+            cudaMalloc((void**)&gradientAccumulation[transformerIndex].key_gamma_weights, dim * sizeof(float));
+        }
+        if (CONFIG_QUERY_GATING) {
+            cudaMalloc((void**)&gradientAccumulation[transformerIndex].gated_query_weights, dim * dim * sizeof(float));
+        }
     }
 }
 
@@ -69,6 +77,17 @@ static void allocateFastMomentumMemory() {
         
         cudaMalloc((void**)&fastEMA[transformerIndex].rms1_gamma_weights, dim * sizeof(float));
         cudaMemset(fastEMA[transformerIndex].rms1_gamma_weights, 0, dim * sizeof(float));        
+
+        if (CONFIG_QK_RMS_NORM) {
+            cudaMalloc((void**)&fastEMA[transformerIndex].query_gamma_weights, dim * sizeof(float));
+            cudaMemset(fastEMA[transformerIndex].query_gamma_weights, 0, dim * sizeof(float));
+            cudaMalloc((void**)&fastEMA[transformerIndex].key_gamma_weights, dim * sizeof(float));
+            cudaMemset(fastEMA[transformerIndex].key_gamma_weights, 0, dim * sizeof(float));
+        }
+        if (CONFIG_QUERY_GATING) {
+            cudaMalloc((void**)&fastEMA[transformerIndex].gated_query_weights, dim * dim * sizeof(float));
+            cudaMemset(fastEMA[transformerIndex].gated_query_weights, 0, dim * dim * sizeof(float));
+        }
     }
 }
 
@@ -110,6 +129,17 @@ static void allocateSlowMomentumMemory() {
         
         cudaMalloc((void**)&slowEMA[transformerIndex].rms1_gamma_weights, dim * sizeof(float));
         cudaMemset(slowEMA[transformerIndex].rms1_gamma_weights, 0, dim * sizeof(float));        
+
+        if (CONFIG_QK_RMS_NORM) {
+            cudaMalloc((void**)&slowEMA[transformerIndex].query_gamma_weights, dim * sizeof(float));
+            cudaMemset(slowEMA[transformerIndex].query_gamma_weights, 0, dim * sizeof(float));
+            cudaMalloc((void**)&slowEMA[transformerIndex].key_gamma_weights, dim * sizeof(float));
+            cudaMemset(slowEMA[transformerIndex].key_gamma_weights, 0, dim * sizeof(float));
+        }
+        if (CONFIG_QUERY_GATING) {
+            cudaMalloc((void**)&slowEMA[transformerIndex].gated_query_weights, dim * dim * sizeof(float));
+            cudaMemset(slowEMA[transformerIndex].gated_query_weights, 0, dim * dim * sizeof(float));
+        }
     }
 }
 
@@ -151,6 +181,17 @@ static void allocateVarianceMemory() {
         
         cudaMalloc((void**)&variance[transformerIndex].rms1_gamma_weights, dim * sizeof(float));
         cudaMemset(variance[transformerIndex].rms1_gamma_weights, 0, dim * sizeof(float));        
+
+        if (CONFIG_QK_RMS_NORM) {
+            cudaMalloc((void**)&variance[transformerIndex].query_gamma_weights, dim * sizeof(float));
+            cudaMemset(variance[transformerIndex].query_gamma_weights, 0, dim * sizeof(float));
+            cudaMalloc((void**)&variance[transformerIndex].key_gamma_weights, dim * sizeof(float));
+            cudaMemset(variance[transformerIndex].key_gamma_weights, 0, dim * sizeof(float));
+        }
+        if (CONFIG_QUERY_GATING) {
+            cudaMalloc((void**)&variance[transformerIndex].gated_query_weights, dim * dim * sizeof(float));
+            cudaMemset(variance[transformerIndex].gated_query_weights, 0, dim * dim * sizeof(float));
+        }
     }
 }
 
@@ -208,6 +249,28 @@ static void allocateTrainingMemory() {
         cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPreRoPE, dim * maxL * sizeof(float));
         cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPostRoPE, dim * maxL * sizeof(float));
         cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPreRoPE, dim * maxL * sizeof(float));
+
+        // CONFIG_QK_RMS_NORM backprop buffers
+        if (CONFIG_QK_RMS_NORM) {
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPreRoPE_preRMS, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPreRoPE_preRMS, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].query_gamma_weights, dim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].key_gamma_weights, dim * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_queries_sigma_scale_x_upGrad_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_queries_oneOverR_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_queries_oneOverHeadDimR3_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_keys_sigma_scale_x_upGrad_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_keys_oneOverR_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_keys_oneOverHeadDimR3_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
+        }
+
+        // CONFIG_QUERY_GATING backprop buffers
+        if (CONFIG_QUERY_GATING) {
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].gatedValueScaledSoftmaxAttn, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].gatedQueriesPostSigmoid, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].gatedQueriesPreSigmoid, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].gated_query_weights, dim * dim * sizeof(float));
+        }
 
         cudaMalloc((void**)&backpropCalculations[transformerIndex].value_weights, dim * dim * sizeof(float));
         cudaMalloc((void**)&backpropCalculations[transformerIndex].query_weights, dim * dim * sizeof(float));
@@ -405,6 +468,36 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&currentTransformerWeights_DEVICE->ffn_right_2_weights, ffn_right_2_weights_size);
         cudaMemcpy(currentTransformerWeights_DEVICE->ffn_right_2_weights, currentTransformerWeights->ffn_right_2_weights, ffn_right_2_weights_size, cudaMemcpyHostToDevice);
 
+        // CONFIG_QK_RMS_NORM weights (per-head RMS gamma for queries/keys, sized dim)
+        if (CONFIG_QK_RMS_NORM) {
+            size_t qk_rms_weights_size = dim * sizeof(float);
+
+            currentTransformerWeights->query_RMS_weights = (float*)malloc(qk_rms_weights_size);
+            for (int i = 0; i < dim; i++) {
+                currentTransformerWeights->query_RMS_weights[i] = ((float)rand() / (float)RAND_MAX);
+            }
+            cudaMalloc((void**)&currentTransformerWeights_DEVICE->query_RMS_weights, qk_rms_weights_size);
+            cudaMemcpy(currentTransformerWeights_DEVICE->query_RMS_weights, currentTransformerWeights->query_RMS_weights, qk_rms_weights_size, cudaMemcpyHostToDevice);
+
+            currentTransformerWeights->key_RMS_weights = (float*)malloc(qk_rms_weights_size);
+            for (int i = 0; i < dim; i++) {
+                currentTransformerWeights->key_RMS_weights[i] = ((float)rand() / (float)RAND_MAX);
+            }
+            cudaMalloc((void**)&currentTransformerWeights_DEVICE->key_RMS_weights, qk_rms_weights_size);
+            cudaMemcpy(currentTransformerWeights_DEVICE->key_RMS_weights, currentTransformerWeights->key_RMS_weights, qk_rms_weights_size, cudaMemcpyHostToDevice);
+        }
+
+        // CONFIG_QUERY_GATING weights (query gating projection, sized dim x dim)
+        if (CONFIG_QUERY_GATING) {
+            size_t gated_query_weights_size = dim * dim * sizeof(float);
+            currentTransformerWeights->gated_query_weights = (float*)malloc(gated_query_weights_size);
+            for (int i = 0; i < dim * dim; i++) {
+                currentTransformerWeights->gated_query_weights[i] = ((float)rand() / (float)RAND_MAX);
+            }
+            cudaMalloc((void**)&currentTransformerWeights_DEVICE->gated_query_weights, gated_query_weights_size);
+            cudaMemcpy(currentTransformerWeights_DEVICE->gated_query_weights, currentTransformerWeights->gated_query_weights, gated_query_weights_size, cudaMemcpyHostToDevice);
+        }
+
         // Transformer calculation buffers (allocated at maxL capacity)
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_sumByCol_RMS1, maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_postRMS1_pre_gamma, dim * maxL * sizeof(float));
@@ -412,6 +505,14 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].values, dim * maxL * sizeof(float));
+        if (CONFIG_QK_RMS_NORM) {
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries_RMS_sumByColByHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys_RMS_sumByColByHead, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries_post_RMS_pre_gamma, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries_postRMS_post_gamma, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys_post_RMS_pre_gamma, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys_postRMS_post_gamma, dim * maxL * sizeof(float));
+        }
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queriesPostRoPE, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keysPostRoPE, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHead, attnHeads * maxL * maxL * sizeof(float));
@@ -421,6 +522,11 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_expfCache_softmax, attnHeads * maxL * maxL * sizeof(float));        
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_postSoftmax, attnHeads * maxL * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].valueScaledSoftmaxAttn, dim * maxL * sizeof(float));
+        if (CONFIG_QUERY_GATING) {
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].gatedQueries, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].gatedQueriesPostSigmoid, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].gatedValueScaledSoftmaxAttn, dim * maxL * sizeof(float));
+        }
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProj, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].outputProjPlusResidual_sumByCol_RMS2, maxL * sizeof(float));

@@ -14,6 +14,11 @@ typedef struct {
     float* ffn_left_weights; 
     float* ffn_right_1_weights; 
     float* ffn_right_2_weights; 
+    // CONFIG_QK_RMS_NORM
+    float* query_RMS_weights; 
+    float* key_RMS_weights; 
+    // CONFIG_QUERY_GATING
+    float* gated_query_weights; 
 } TransformerWeights;
 
 typedef struct {
@@ -23,6 +28,13 @@ typedef struct {
     float* queries;
     float* keys;
     float* values;
+    // CONFIG_QK_RMS_NORM
+    float* queries_RMS_sumByColByHead;
+    float* keys_RMS_sumByColByHead;
+    float* queries_post_RMS_pre_gamma;
+    float* queries_postRMS_post_gamma;
+    float* keys_post_RMS_pre_gamma;
+    float* keys_postRMS_post_gamma;
     float* queriesPostRoPE;
     float* keysPostRoPE;
     float* attnKtQByHead;
@@ -32,6 +44,10 @@ typedef struct {
     float* attnByHead_expfCache_softmax;
     float* attnByHead_postSoftmax;
     float* valueScaledSoftmaxAttn;
+    // CONFIG_QUERY_GATING
+    float* gatedQueries;
+    float* gatedQueriesPostSigmoid;
+    float* gatedValueScaledSoftmaxAttn;
     float* outputProj;
     float* outputProjPlusResidual;
     float* outputProjPlusResidual_sumByCol_RMS2;
@@ -65,6 +81,11 @@ typedef struct {
     float* outputProjPlusResidual;
     float* output_proj_weights;
     float* valueScaledSoftmaxAttn;
+    // CONFIG_QUERY_GATING
+    float* gatedValueScaledSoftmaxAttn;
+    float* gatedQueriesPostSigmoid;
+    float* gatedQueriesPreSigmoid;
+    float* gated_query_weights;
     float* attnByHead_postSoftmax;
     float* attnSoftmaxGradSumByCol;
     float* values;
@@ -73,6 +94,17 @@ typedef struct {
     float* keysPreRoPE;    
     float* queriesPostRoPE;
     float* queriesPreRoPE;
+    // CONFIG_QK_RMS_NORM
+    float* queriesPreRoPE_preRMS;
+    float* keysPreRoPE_preRMS;
+    float* query_gamma_weights;
+    float* key_gamma_weights;
+    float* rms_queries_sigma_scale_x_upGrad_byCol_RMS_byHead;
+    float* rms_queries_oneOverR_byCol_RMS_byHead;
+    float* rms_queries_oneOverHeadDimR3_byCol_RMS_byHead;
+    float* rms_keys_sigma_scale_x_upGrad_byCol_RMS_byHead;
+    float* rms_keys_oneOverR_byCol_RMS_byHead;
+    float* rms_keys_oneOverHeadDimR3_byCol_RMS_byHead;
     float* value_weights;
     float* key_weights;
     float* query_weights;
@@ -94,6 +126,11 @@ typedef struct {
     float* query_weights;
     float* key_weights;
     float* rms1_gamma_weights;
+    // CONFIG_QK_RMS_NORM
+    float* query_gamma_weights;
+    float* key_gamma_weights;
+    // CONFIG_QUERY_GATING
+    float* gated_query_weights;
 } OptimizerTransformerState;
 
 #ifdef __cplusplus
