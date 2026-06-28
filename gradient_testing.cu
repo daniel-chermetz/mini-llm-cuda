@@ -9,7 +9,7 @@
 #include <cuda_runtime.h>
 #include <sys/stat.h>
 
-#include "cJSON.h"
+#include "cJSON/cJSON.h"
 #include "network_meta.h"
 #include "network_globals.h"
 #include "load_model.h"

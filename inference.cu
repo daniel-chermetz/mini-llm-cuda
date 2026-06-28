@@ -469,8 +469,8 @@ int runInference(int L) {
             getRMSColSumsAcrossHeads<<<qkRMSGridDim, 64, sharedMemSize_head>>>(transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead, transformerCalculations_DEVICE[tIndex].queries);
             getRMSColSumsAcrossHeads<<<qkRMSGridDim, 64, sharedMemSize_head>>>(transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead, transformerCalculations_DEVICE[tIndex].keys);
 
-            applyRMSNormAcrossHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma, transformerCalculations_DEVICE[tIndex].queries_post_RMS_pre_gamma, transformerCalculations_DEVICE[tIndex].queries, transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead, transformerWeights_DEVICE[tIndex].queries_RMS_weights, L);
-            applyRMSNormAcrossHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma, transformerCalculations_DEVICE[tIndex].keys_post_RMS_pre_gamma, transformerCalculations_DEVICE[tIndex].keys, transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead, transformerWeights_DEVICE[tIndex].keys_RMS_weights, L);
+            applyRMSNormAcrossHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma, transformerCalculations_DEVICE[tIndex].queries_post_RMS_pre_gamma, transformerCalculations_DEVICE[tIndex].queries, transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead, transformerWeights_DEVICE[tIndex].query_RMS_weights, L);
+            applyRMSNormAcrossHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma, transformerCalculations_DEVICE[tIndex].keys_post_RMS_pre_gamma, transformerCalculations_DEVICE[tIndex].keys, transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead, transformerWeights_DEVICE[tIndex].key_RMS_weights, L);
         }
 
         xTotalThreads = dimPairs * L;

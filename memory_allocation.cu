@@ -275,7 +275,7 @@ void allocateMemory(bool allocateTraining) {
 
     // 2. Compute Power
     printf("Multiprocessors (SMs): %d\n", prop.multiProcessorCount);
-    printf("Clock Rate: %.0f MHz\n", (double)prop.clockRate / 1000.0);
+    // printf("Clock Rate: %.0f MHz\n", (double)prop.clockRate / 1000.0);
 
     // 3. Kernel Launch Constraints
     printf("Max Threads per Block: %d\n", prop.maxThreadsPerBlock);
@@ -284,7 +284,7 @@ void allocateMemory(bool allocateTraining) {
 
     // 4. Memory Speed
     printf("Memory Bus Width: %d-bit\n", prop.memoryBusWidth);
-    printf("Memory Clock: %.0f MHz\n", (double)prop.memoryClockRate / 1000.0);
+    // printf("Memory Clock: %.0f MHz\n", (double)prop.memoryClockRate / 1000.0);
     
     printf("====================\n\n");    
 

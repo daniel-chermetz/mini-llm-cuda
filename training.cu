@@ -875,7 +875,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 				backpropCalculations[tIndex].rms_queries_oneOverHeadDimR3_byCol_RMS_byHead,
 				transformerCalculations_DEVICE[tIndex].queries,
 				transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead,
-				transformerWeights_DEVICE[tIndex].queries_RMS_weights,
+				transformerWeights_DEVICE[tIndex].query_RMS_weights,
 				backpropCalculations[tIndex].queriesPreRoPE,
 				L
 			);
@@ -886,7 +886,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 				backpropCalculations[tIndex].rms_keys_oneOverHeadDimR3_byCol_RMS_byHead,
 				transformerCalculations_DEVICE[tIndex].keys,
 				transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead,
-				transformerWeights_DEVICE[tIndex].keys_RMS_weights,
+				transformerWeights_DEVICE[tIndex].key_RMS_weights,
 				backpropCalculations[tIndex].keysPreRoPE,
 				L
 			);
@@ -897,7 +897,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 				backpropCalculations[tIndex].rms_queries_sigma_scale_x_upGrad_byCol_RMS_byHead,
 				backpropCalculations[tIndex].rms_queries_oneOverR_byCol_RMS_byHead,
 				backpropCalculations[tIndex].rms_queries_oneOverHeadDimR3_byCol_RMS_byHead,
-				transformerWeights_DEVICE[tIndex].queries_RMS_weights,
+				transformerWeights_DEVICE[tIndex].query_RMS_weights,
 				backpropCalculations[tIndex].queriesPreRoPE
 			);
 
@@ -907,7 +907,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 				backpropCalculations[tIndex].rms_keys_sigma_scale_x_upGrad_byCol_RMS_byHead,
 				backpropCalculations[tIndex].rms_keys_oneOverR_byCol_RMS_byHead,
 				backpropCalculations[tIndex].rms_keys_oneOverHeadDimR3_byCol_RMS_byHead,
-				transformerWeights_DEVICE[tIndex].keys_RMS_weights,
+				transformerWeights_DEVICE[tIndex].key_RMS_weights,
 				backpropCalculations[tIndex].keysPreRoPE
 			);
 
@@ -915,7 +915,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	    	numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 
 			dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
-				backpropCalculations[tIndex].queries_gamma_weights,
+				backpropCalculations[tIndex].query_gamma_weights,
 				transformerCalculations_DEVICE[tIndex].queries_post_RMS_pre_gamma,
 				rightEndIndex,
 				backpropCalculations[tIndex].queriesPreRoPE,
@@ -923,7 +923,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	    	);
 
 			dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
-				backpropCalculations[tIndex].keys_gamma_weights,
+				backpropCalculations[tIndex].key_gamma_weights,
 				transformerCalculations_DEVICE[tIndex].keys_post_RMS_pre_gamma,
 				rightEndIndex,
 				backpropCalculations[tIndex].keysPreRoPE,
@@ -1210,8 +1210,8 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			cudaMemcpy(gradientAccumulation[transformerIndex].rms1_gamma_weights, backpropCalculations[transformerIndex].rms1_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
 
 			if (CONFIG_QK_RMS_NORM) {
-				cudaMemcpy(gradientAccumulation[transformerIndex].queries_gamma_weights, backpropCalculations[transformerIndex].queries_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
-				cudaMemcpy(gradientAccumulation[transformerIndex].keys_gamma_weights, backpropCalculations[transformerIndex].keys_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+				cudaMemcpy(gradientAccumulation[transformerIndex].query_gamma_weights, backpropCalculations[transformerIndex].query_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+				cudaMemcpy(gradientAccumulation[transformerIndex].key_gamma_weights, backpropCalculations[transformerIndex].key_gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
 			}
 			if (CONFIG_QUERY_GATING) {
 				cudaMemcpy(gradientAccumulation[transformerIndex].gated_query_weights, backpropCalculations[transformerIndex].gated_query_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
@@ -1248,8 +1248,8 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].rms1_gamma_weights, backpropCalculations[transformerIndex].rms1_gamma_weights, dim);
 			add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].rms2_gamma_weights, backpropCalculations[transformerIndex].rms2_gamma_weights, dim);
 			if (CONFIG_QK_RMS_NORM) {
-				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].keys_gamma_weights, backpropCalculations[transformerIndex].keys_gamma_weights, dim);
-				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].queries_gamma_weights, backpropCalculations[transformerIndex].queries_gamma_weights, dim);
+				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].key_gamma_weights, backpropCalculations[transformerIndex].key_gamma_weights, dim);
+				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].query_gamma_weights, backpropCalculations[transformerIndex].query_gamma_weights, dim);
 			}
 		}
 	}
