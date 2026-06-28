@@ -92,8 +92,7 @@ __global__ void dLoss_d_RMS_gamma_weights(
 	float* x_postRMS_pre_gamma,
 	int rightEndIndex,
 	float* upstream_grad,
-	int colDim,
-	int L_
+	int colDim
 ) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	if (index >= colDim) {
@@ -105,6 +104,60 @@ __global__ void dLoss_d_RMS_gamma_weights(
     	int colOffset = colIndex * colDim;
 		x_postRMS_pre_gamma_grad[index] += (x_postRMS_pre_gamma[colOffset + index] * upstream_grad[colOffset + index]);
     }
+}
+
+__global__ void preCalcRMSColWideVals_acrossHeads(
+	float* sigma_scale_x_upGrad_byCol_RMS_byHead,
+	float* oneOverR_byCol_RMS_byHead,
+	float* oneOverHeadDimR3_byCol_RMS_byHead,
+	float* x_preRMS,
+	float* x_sumByCol_RMS_byHead,
+	float* gamma_weights_RMS,
+	float* upstream_grad,
+	int L_,
+) {
+    int colIndex = blockIdx.x;
+    int headIndex = blockIdx.y;
+    int colHeadIndex = attnHeads * colIndex + headIndex;
+    int headOffset = headIndex * headDim;
+
+    float x_sum_currentCol = x_sumByCol_RMS_byHead[colHeadIndex];
+    oneOverR_byCol_RMS_byHead[colHeadIndex] = 1.0f / x_sum_currentCol;
+    oneOverHeadDimR3_byCol_RMS_byHead[colHeadIndex] = 1.0f / ((float)headDim * x_sum_currentCol * x_sum_currentCol * x_sum_currentCol);
+
+    int x_preRMS_coloffset = dim * colIndex + headOffset;
+    sigma_scale_x_upGrad_byCol_RMS_byHead[colHeadIndex] = 0;
+	for (int i = 0; i < headDim; i++) {
+		sigma_scale_x_upGrad_byCol_RMS_byHead[colHeadIndex] += (gamma_weights_RMS[headOffset + i] * x_preRMS[x_preRMS_coloffset + i] * upstream_grad[x_preRMS_coloffset + i]);
+	}
+}
+
+__global__ void dLoss_dPreRMSNorm_acrossHeads(
+	float* x_pre_RMS_grad,
+	float* x_pre_RMS,
+	float* sigma_scale_x_upGrad_byCol_RMS_byHead,
+	float* oneOverR_byCol_RMS_byHead,
+	float* oneOverHeadDimR3_byCol_RMS_byHead,
+	float* gamma_weights_RMS,
+	float* upstream_grad,
+) {
+	int colIndex = blockIdx.x; // L: 1280 at the most
+	int headIndex = blockIdx.y; // attnHeads: 16 at the most
+	int withinHeadRowIndex = threadIdx.x; // 256 at the most
+
+	int colHeadIndex = colIndex * attnHeads + headIndex;
+	int rowIndex = headIndex * headDim + withinHeadRowIndex;
+
+	int globalIndex = colIndex * dim + rowIndex;
+
+    x_pre_RMS_grad[globalIndex] =
+    	upstream_grad[globalIndex] *
+    	gamma_weights_RMS[rowIndex] *
+    	oneOverR_byCol_RMS_byHead[colHeadIndex]
+    	-
+    	x_pre_RMS[globalIndex] *
+    	sigma_scale_x_upGrad_byCol_RMS_byHead[colHeadIndex] *
+    	oneOverHeadDimR3_byCol_RMS_byHead[colHeadIndex];
 }
 
 __global__ void dLoss_d_ffn_right_pre_hadamard_backprop(float* dLoss_d_ffn_right_1_postSilu, float* dLoss_d_ffn_right_2, float* ffn_right_1_postSilu, float* ffn_right_2, float* dLoss_d_ffn_right_postHadamard, int ffnDim_, int L_) {
@@ -244,6 +297,28 @@ __global__ void add_x_grad_to_embeddings_grad(float* embedding_weights_grad, flo
     atomicAdd(&embedding_weights_grad[embeddingIndex * dim_ + featureIndex], x_grad[index]);
 }
 
+__global__ void dLoss_d_hadamard_valueScaledSoftmaxAttn_gatedQueries(float* gatedQueriesPostSigmoid_grad, float* valueScaledSoftmaxAttn_grad, float* gatedValueScaledSoftmaxAttn_grad, float* valueScaledSoftmaxAttn, float* gatedQueriesPostSigmoid, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxCount = dim * L_;
+    if (index >= maxCount) {
+    	return;
+    }
+
+    valueScaledSoftmaxAttn_grad[index] = gatedQueriesPostSigmoid[index] * gatedValueScaledSoftmaxAttn_grad[index];
+    gatedQueriesPostSigmoid_grad[index] = valueScaledSoftmaxAttn[index] * gatedValueScaledSoftmaxAttn_grad[index];
+}
+
+__global__ void dLoss_d_gatedQueriesPreSigmoid(float* gatedQueriesPreSigmoid_grad, float* gatedQueriesPostSigmoid_grad, float* gatedQueriesPostSigmoid, int L_) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int maxCount = dim * L_;
+    if (index >= maxCount) {
+    	return;
+    }
+
+    float s = gatedQueriesPostSigmoid[index];
+    gatedQueriesPreSigmoid_grad[index] = (s * (1.0f - s) * gatedQueriesPostSigmoid_grad[index]);
+}
+
 void setupRoPEThetaStore(int maxL_) {
 	int xTotalThreads = dim / 2 * maxL_;
     int numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;	
@@ -357,8 +432,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		ffn_postRMS_pre_gamma_DEVICE,
 		rightEndIndex,
 		dLoss_d_ffn_final_postRMS_postGamma,
-		dim,
-		L
+		dim
 	);	
 
 	for (int tIndex = 0; tIndex < transformers; tIndex++) {
@@ -566,7 +640,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 			transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_postRMS2_pre_gamma,
 			rightEndIndex,
 			backpropCalculations[tIndex].outputProjPlusResidual_postRMS2_post_gamma,
-			dim, L
+			dim
 		);
 
 		xTotalThreads = dim * L;
@@ -594,7 +668,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
 		    &beta,
-		    backpropCalculations[tIndex].valueScaledSoftmaxAttn,
+		    (CONFIG_QUERY_GATING ? backpropCalculations[tIndex].gatedValueScaledSoftmaxAttn : backpropCalculations[tIndex].valueScaledSoftmaxAttn),
 		    CUDA_R_32F,
 		    dim, // ldc, mem col size
 		    CUBLAS_COMPUTE_32F,
@@ -614,7 +688,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    backpropCalculations[tIndex].outputProjPlusResidual,
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
-		    transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn,
+		    (CONFIG_QUERY_GATING ? transformerCalculations_DEVICE[tIndex].gatedValueScaledSoftmaxAttn : transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn),
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
 		    &beta,
@@ -624,6 +698,24 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    CUBLAS_COMPUTE_32F,
 		    CUBLAS_GEMM_DEFAULT             
 		);
+
+		if (CONFIG_QUERY_GATING) {
+			dLoss_d_hadamard_valueScaledSoftmaxAttn_gatedQueries<<<numBlocks, threadsPerBlock>>>(
+				backpropCalculations[tIndex].gatedQueriesPostSigmoid,
+				backpropCalculations[tIndex].valueScaledSoftmaxAttn,
+				backpropCalculations[tIndex].gatedValueScaledSoftmaxAttn,
+				transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn,
+				transformerCalculations_DEVICE[tIndex].gatedQueriesPostSigmoid,
+				L
+			);
+
+			dLoss_d_gatedQueriesPreSigmoid<<<numBlocks, threadsPerBlock>>>(
+				backpropCalculations[tIndex].gatedQueriesPreSigmoid,
+				backpropCalculations[tIndex].gatedQueriesPostSigmoid,
+				transformerCalculations_DEVICE[tIndex].gatedQueriesPostSigmoid,
+				L
+			);
+		}
 
 		// dL/dA [dim, L] = G [dim, L] @ B.t [L, L]
 		// (dLoss / d_valueScaledSoftmaxAttn) / (d_valueScaledSoftmaxAttn / d_values)	
@@ -774,7 +866,70 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	    	L
 	    );
 
-	    // CHECKED
+	    if (CONFIG_QK_RMS_NORM) {
+            dim3 qkRMSGridDim(L, attnHeads);
+
+			preCalcRMSColWideVals_acrossHeads<<<qkRMSGridDim, 1>>>(
+				backpropCalculations[tIndex].rms_queries_sigma_scale_x_upGrad_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_queries_oneOverR_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_queries_oneOverHeadDimR3_byCol_RMS_byHead,
+				transformerCalculations_DEVICE[tIndex].queries,
+				transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead,
+				transformerWeights_DEVICE[tIndex].queries_RMS_weights,
+				backpropCalculations[tIndex].queriesPreRoPE,
+				L
+			);
+
+			preCalcRMSColWideVals_acrossHeads<<<qkRMSGridDim, 1>>>(
+				backpropCalculations[tIndex].rms_keys_sigma_scale_x_upGrad_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_keys_oneOverR_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_keys_oneOverHeadDimR3_byCol_RMS_byHead,
+				transformerCalculations_DEVICE[tIndex].keys,
+				transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead,
+				transformerWeights_DEVICE[tIndex].keys_RMS_weights,
+				backpropCalculations[tIndex].keysPreRoPE,
+				L
+			);
+
+			dLoss_dPreRMSNorm_acrossHeads<<<qkRMSGridDim, headDim>>>(
+				backpropCalculations[tIndex].queriesPreRoPE_preRMS,
+				transformerCalculations_DEVICE[tIndex].queries,
+				backpropCalculations[tIndex].rms_queries_sigma_scale_x_upGrad_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_queries_oneOverR_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_queries_oneOverHeadDimR3_byCol_RMS_byHead,
+				transformerWeights_DEVICE[tIndex].queries_RMS_weights,
+				backpropCalculations[tIndex].queriesPreRoPE
+			);
+
+			dLoss_dPreRMSNorm_acrossHeads<<<qkRMSGridDim, headDim>>>(
+				backpropCalculations[tIndex].keysPreRoPE_preRMS,
+				transformerCalculations_DEVICE[tIndex].keys,
+				backpropCalculations[tIndex].rms_keys_sigma_scale_x_upGrad_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_keys_oneOverR_byCol_RMS_byHead,
+				backpropCalculations[tIndex].rms_keys_oneOverHeadDimR3_byCol_RMS_byHead,
+				transformerWeights_DEVICE[tIndex].keys_RMS_weights,
+				backpropCalculations[tIndex].keysPreRoPE
+			);
+
+			xTotalThreads = dim;
+	    	numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+			dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
+				backpropCalculations[tIndex].queries_gamma_weights,
+				transformerCalculations_DEVICE[tIndex].queries_post_RMS_pre_gamma,
+				rightEndIndex,
+				backpropCalculations[tIndex].queriesPreRoPE,
+				dim
+	    	);
+
+			dLoss_d_RMS_gamma_weights<<<numBlocks, threadsPerBlock>>>(
+				backpropCalculations[tIndex].keys_gamma_weights,
+				transformerCalculations_DEVICE[tIndex].keys_post_RMS_pre_gamma,
+				rightEndIndex,
+				backpropCalculations[tIndex].keysPreRoPE,
+				dim
+	    	);
+	    }
 
 		// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
 		// (dLoss / d_values) / (d_values / d_value_weights)
@@ -809,7 +964,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    dim, // cols C
 		    L, // contracting (shared) dim
 		    &alpha,
-		    backpropCalculations[tIndex].keysPreRoPE,
+		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].keysPreRoPE_preRMS : backpropCalculations[tIndex].keysPreRoPE),
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
 		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
@@ -832,7 +987,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    dim, // cols C
 		    L, // contracting (shared) dim
 		    &alpha,
-		    backpropCalculations[tIndex].queriesPreRoPE,
+		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].queriesPreRoPE_preRMS : backpropCalculations[tIndex].queriesPreRoPE),
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
 		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
@@ -845,6 +1000,31 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    CUBLAS_COMPUTE_32F,
 		    CUBLAS_GEMM_DEFAULT             
 		);
+		if (CONFIG_QUERY_GATING) {
+			// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
+			// (dLoss / d_gatedQueriesPreSigmoid) / (d_gatedQueriesPreSigmoid / d_gated_query_weights)
+			cublasGemmEx(
+			    handle,
+			    CUBLAS_OP_N,
+			    CUBLAS_OP_T,
+			    dim, // rows C
+			    dim, // cols C
+			    L, // contracting (shared) dim
+			    &alpha,
+			    backpropCalculations[tIndex].gatedQueriesPreSigmoid,
+			    CUDA_R_32F,
+			    dim, // lda, mem col size for col-major
+			    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
+			    CUDA_R_32F,
+			    dim, // ldb, mem col size for col-major
+			    &beta,
+			    backpropCalculations[tIndex].gated_query_weights,
+			    CUDA_R_32F,
+			    dim, // ldc, mem col size
+			    CUBLAS_COMPUTE_32F,
+			    CUBLAS_GEMM_DEFAULT
+			);
+		}
 
 		// dL/dB [dim, L] = A.t [dim, dim] @ G [dim, L]
 		// (dLoss / d_values) / (d_values / d_x)
@@ -867,7 +1047,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    CUDA_R_32F,
 		    dim, // ldc, mem col size
 		    CUBLAS_COMPUTE_32F,
-		    CUBLAS_GEMM_DEFAULT             
+		    CUBLAS_GEMM_DEFAULT
 		);
 		// dL/dB [dim, L] = A.t [dim, dim] @ G [dim, L]
 		// (dLoss / d_keysPreRoPE) / (d_keysPreRoPE / d_x)
@@ -882,7 +1062,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    transformerWeights_DEVICE[tIndex].key_weights,
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
-		    backpropCalculations[tIndex].keysPreRoPE,
+		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].keysPreRoPE_preRMS : backpropCalculations[tIndex].keysPreRoPE),
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
 		    &beta_one,
@@ -905,7 +1085,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    transformerWeights_DEVICE[tIndex].query_weights,
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
-		    backpropCalculations[tIndex].queriesPreRoPE,
+		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].queriesPreRoPE_preRMS : backpropCalculations[tIndex].queriesPreRoPE),
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
 		    &beta_one,
@@ -915,6 +1095,32 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    CUBLAS_COMPUTE_32F,
 		    CUBLAS_GEMM_DEFAULT             
 		);
+
+		if (CONFIG_QUERY_GATING) {
+			// dL/dB [dim, L] = A.t [dim, dim] @ G [dim, L]
+			// (dLoss / d_gatedQueriesPreSigmoid) / (d_gatedQueriesPreSigmoid / d_x)
+			cublasGemmEx(
+			    handle,
+			    CUBLAS_OP_T,
+			    CUBLAS_OP_N,
+			    dim, // rows C
+			    L, // cols C
+			    dim, // contracting (shared) dim
+			    &alpha,
+			    transformerWeights_DEVICE[tIndex].gated_query_weights,
+			    CUDA_R_32F,
+			    dim, // lda, mem col size for col-major
+			    backpropCalculations[tIndex].gatedQueriesPreSigmoid,
+			    CUDA_R_32F,
+			    dim, // ldb, mem col size for col-major
+			    &beta_one,
+			    backpropCalculations[tIndex].x_postRMS1_post_gamma,
+			    CUDA_R_32F,
+			    dim, // ldc, mem col size
+			    CUBLAS_COMPUTE_32F,
+			    CUBLAS_GEMM_DEFAULT
+			);
+		}
 
 		xTotalThreads = L;
 	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
@@ -956,7 +1162,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 			transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma,
 			rightEndIndex,
 			backpropCalculations[tIndex].x_postRMS1_post_gamma,
-			dim, L
+			dim
 		);
 
 		xTotalThreads = dim * L;
