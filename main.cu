@@ -2,9 +2,17 @@
 nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
      inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
      training_orchestrator.cu optimizer.cu random_weights.cu save_model.cu \
-     -o inference \
+     -o mini_llm_cuda \
      -lcublas -lcurand \
      -arch=sm_86
+*/
+/*
+nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
+     inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
+     training_orchestrator.cu optimizer.cu random_weights.cu save_model.cu \
+     -o mini_llm_cuda \
+     -lcublas -lcurand \
+     -arch=sm_89
 */
 
 #include <chrono>
@@ -14,7 +22,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu train
 #include <string.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include "cJSON.h"
+#include "cJSON/cJSON.h"
 
 #include "network_meta.h"
 #include "network_globals.h"
@@ -199,7 +207,7 @@ int main(int argc, char* argv[]) {
     
     // --- INFERENCE MODE ---
     // Run text generation inference loop
-    const char* storiesPath = "./tokenizedStories/tokenizedStories_0001.json";
+    const char* storiesPath = "../tokenizedStories/tokenizedStories_0001.json";
     int storyIndex = (argc > 2) ? atoi(argv[2]) : 0;
     int contextPercent = (argc > 3) ? atoi(argv[3]) : 100;
     bool skipUserInput = true;
