@@ -400,6 +400,24 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
         if (printTokens) {
             printf("\n--- Story %d prediction preview (first & last 20 of %d positions) ---\n",
                    storyIndex, rightEndIndex - leftStartIndex + 1);
+            
+            // Log the instruct prefix (positions 0..leftStartIndex-1) before the story
+            // tokens. These positions are context only (not trained), shown here in full.
+            if (leftStartIndex > 0) {
+                printf("[instruct prefix, %d tokens]\n", leftStartIndex);
+                for (int pos = 0; pos < leftStartIndex; pos++) {
+                    int curIdx = seqTokenIndices[pos];
+                    int nextIdx = seqTokenIndices[pos + 1];
+                    float p = hostVocabSoftmax[pos * vocabSize + nextIdx];
+                    if (p < 0.0001f) p = 0.0001f;
+                    char curStr[64];
+                    char nextStr[64];
+                    getDisplayToken(curIdx, curStr, sizeof(curStr));
+                    getDisplayToken(nextIdx, nextStr, sizeof(nextStr));
+                    printf("%s --> %s (%.2f%%)\n", curStr, nextStr, p * 100.0f);
+                }
+                printf("[story]\n");
+            }
         }
         
         // For each position from leftStartIndex to rightEndIndex, we predict the next token
