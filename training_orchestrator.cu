@@ -51,6 +51,11 @@
 static int* hostRightEndIndices_storage = nullptr;
 static int hostRightEndIndices_count = 0;
 
+// Host-side storage for leftStartIndices (first token position that contributes
+// gradients). With instruct prepended this is the last instruct token (the second
+// \n), so the instruct tokens themselves are not trained as prediction targets.
+static int* hostLeftStartIndices_storage = nullptr;
+
 // Host-side buffer for softmax scores (for logging predictions)
 static float* hostVocabSoftmax = nullptr;
 
@@ -180,11 +185,13 @@ static int loadStoriesFromFile(const char* filePath, int fileIndex, int* numStor
     // Format: [story0_token0, story0_token1, ..., story0_tokenN, story1_token0, ...]
     int* hostTokenIndices = (int*)malloc(numStories * TOKENS_PER_STORY * sizeof(int));
     int* hostRightEndIndices = (int*)malloc(numStories * sizeof(int));
+    int* hostLeftStartIndices = (int*)malloc(numStories * sizeof(int));
     
-    if (!hostTokenIndices || !hostRightEndIndices) {
+    if (!hostTokenIndices || !hostRightEndIndices || !hostLeftStartIndices) {
         printf("Error: Failed to allocate host memory for token indices.\n");
         if (hostTokenIndices) free(hostTokenIndices);
         if (hostRightEndIndices) free(hostRightEndIndices);
+        if (hostLeftStartIndices) free(hostLeftStartIndices);
         if (instructRoot) cJSON_Delete(instructRoot);
         cJSON_Delete(root);
         free(jsonContent);
@@ -243,6 +250,11 @@ static int loadStoriesFromFile(const char* filePath, int fileIndex, int* numStor
         }
         
         hostRightEndIndices[storiesLoaded] = rightEndIndex;
+        
+        // Gradients start at the last instruct token (the second \n) so the instruct
+        // prefix is used as context but not trained as prediction targets. Without
+        // instruct, gradients start at position 0.
+        hostLeftStartIndices[storiesLoaded] = (instructCount > 0) ? (instructCount - 1) : 0;
         
         // Calculate base offset for this story in the token array
         int baseOffset = storiesLoaded * TOKENS_PER_STORY;
@@ -311,6 +323,11 @@ static int loadStoriesFromFile(const char* filePath, int fileIndex, int* numStor
     hostRightEndIndices_storage = hostRightEndIndices;
     hostRightEndIndices_count = storiesLoaded;
     
+    if (hostLeftStartIndices_storage != nullptr) {
+        free(hostLeftStartIndices_storage);
+    }
+    hostLeftStartIndices_storage = hostLeftStartIndices;
+    
     if (instructRoot) cJSON_Delete(instructRoot);
     cJSON_Delete(root);
     free(jsonContent);
@@ -339,7 +356,9 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
     // Get the rightEndIndex for this story (from host storage)
     int rightEndIndex = hostRightEndIndices_storage[storyIndex];
     int L = rightEndIndex + 1;  // Number of positions for inference (0..rightEndIndex)
-    int leftStartIndex = 0;
+    // First position that contributes gradients (last instruct token when instruct
+    // is active, otherwise 0).
+    int leftStartIndex = hostLeftStartIndices_storage[storyIndex];
     
     // Calculate offset into trainingStoryTokens_DEVICE for this story
     // Each story slot has TOKENS_PER_STORY (maxL+1) entries
@@ -374,16 +393,17 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
         cudaMemcpy(hostVocabSoftmax, vocabScores_postSoftmax_DEVICE, 
                    vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
         
-        // Only the first 20 and last 20 positions are printed as a preview.
-        int previewHead = 20;                          // print positions [0, 20)
+        // Loss and preview cover only the trained region [leftStartIndex, rightEndIndex].
+        // Only the first 20 and last 20 positions of that region are printed as a preview.
+        int previewHeadEnd = leftStartIndex + 20;      // print positions [leftStartIndex, leftStartIndex+20)
         int previewTailStart = rightEndIndex - 19;     // print positions [rightEndIndex-19, rightEndIndex]
         if (printTokens) {
             printf("\n--- Story %d prediction preview (first & last 20 of %d positions) ---\n",
-                   storyIndex, rightEndIndex + 1);
+                   storyIndex, rightEndIndex - leftStartIndex + 1);
         }
         
-        // For each position from 0 to rightEndIndex, we predict the next token
-        for (int pos = 0; pos <= rightEndIndex; pos++) {
+        // For each position from leftStartIndex to rightEndIndex, we predict the next token
+        for (int pos = leftStartIndex; pos <= rightEndIndex; pos++) {
             int currentTokenIdx = seqTokenIndices[pos];
             int nextTokenIdx = seqTokenIndices[pos + 1];  // Target token
             
@@ -403,13 +423,13 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
             numPredictions++;
             
             if (printTokens) {
-                if (pos < previewHead || pos >= previewTailStart) {
+                if (pos < previewHeadEnd || pos >= previewTailStart) {
                     char currentTokenStr[64];
                     char nextTokenStr[64];
                     getDisplayToken(currentTokenIdx, currentTokenStr, sizeof(currentTokenStr));
                     getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
                     printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
-                } else if (pos == previewHead) {
+                } else if (pos == previewHeadEnd) {
                     printf("   ... (%d positions omitted) ...\n", previewTailStart - previewHead);
                 }
             }
@@ -621,6 +641,10 @@ int runTrainingLoop(void) {
         free(hostRightEndIndices_storage);
         hostRightEndIndices_storage = nullptr;
         hostRightEndIndices_count = 0;
+    }
+    if (hostLeftStartIndices_storage != nullptr) {
+        free(hostLeftStartIndices_storage);
+        hostLeftStartIndices_storage = nullptr;
     }
     
     if (instructActive) {
