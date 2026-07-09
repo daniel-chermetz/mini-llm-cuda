@@ -430,7 +430,7 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
                     getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
                     printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
                 } else if (pos == previewHeadEnd) {
-                    printf("   ... (%d positions omitted) ...\n", previewTailStart - previewHead);
+                    printf("   ... (%d positions omitted) ...\n", previewTailStart - previewHeadEnd);
                 }
             }
         }
