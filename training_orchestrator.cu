@@ -19,6 +19,7 @@
 #include "inference.h"
 #include "training.h"
 #include "training_orchestrator.h"
+#include "training_orchestrator_instruct_helper.h"
 #include "optimizer.h"
 #include "save_model.h"
 
@@ -27,16 +28,20 @@
 // ============================================================================
 
 // Base path for tokenized stories
-#define TOKENIZED_STORIES_PATH "./tokenizedStories"
+#define TOKENIZED_STORIES_PATH "../tokenizedStories2"
 
 // Printing frequency: print every N batches (set to 1 to print all)
-#define PRINT_EVERY_N_BATCHES 20
+#define PRINT_EVERY_N_BATCHES 50
 
 // Save frequency: save model every N optimizer iterations (100k = 100000)
-#define SAVE_EVERY_N_ITERATIONS 20000
+#define SAVE_EVERY_N_ITERATIONS 30000
 
 // Model save path template (iteration number will be inserted)
 #define MODEL_SAVE_PATH "./model/victorian_weights_iter_%d.bin"
+
+// Whether to prepend per-story instruct data before training on each story.
+// Set to 0 to disable instruct entirely and train on raw stories only.
+#define USE_INSTRUCT_DATA 1
 
 // ============================================================================
 // MODULE-LEVEL STORAGE
@@ -49,6 +54,9 @@ static int hostRightEndIndices_count = 0;
 // Host-side buffer for softmax scores (for logging predictions)
 static float* hostVocabSoftmax = nullptr;
 
+// Runtime flag: instruct prepending is active (config enabled AND metadata loaded).
+static bool instructActive = false;
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -60,9 +68,9 @@ static bool fileExists(const char* path) {
 }
 
 // Generate the path for a tokenized stories file given its index (1-based)
-// Example: index 1 -> "./tokenizedStories/tokenizedStories_0001.json"
+// Example: index 1 -> "../tokenizedStories2/victorian_stories_0001.json"
 static void getStoriesFilePath(int fileIndex, char* outPath, size_t outSize) {
-    snprintf(outPath, outSize, "%s/tokenizedStories_%04d.json", TOKENIZED_STORIES_PATH, fileIndex);
+    snprintf(outPath, outSize, "%s/victorian_stories_%04d.json", TOKENIZED_STORIES_PATH, fileIndex);
 }
 
 // Wait for user to press Enter
@@ -100,7 +108,7 @@ static void getDisplayToken(int tokenIdx, char* outStr, size_t outSize) {
 
 // Load all stories from a single JSON file into device memory
 // Returns: number of stories loaded, or -1 on error
-static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
+static int loadStoriesFromFile(const char* filePath, int fileIndex, int* numStoriesOut) {
     printf("--- Loading stories from %s ---\n", filePath);
     
     // Open and read file
@@ -158,6 +166,16 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
     
     printf("Processing %d stories...\n", numStories);
     
+    // Optionally load the matching instruct file for this story file. Each story
+    // in the file is paired with the instruct entry at the same index.
+    cJSON* instructRoot = nullptr;
+    if (instructActive) {
+        instructRoot = instructLoadFile(fileIndex);
+        if (!instructRoot) {
+            printf("Warning: No instruct data for file %d; training on raw stories.\n", fileIndex);
+        }
+    }
+    
     // Allocate host buffer for all stories' token indices and rightEndIndices
     // Format: [story0_token0, story0_token1, ..., story0_tokenN, story1_token0, ...]
     int* hostTokenIndices = (int*)malloc(numStories * TOKENS_PER_STORY * sizeof(int));
@@ -167,6 +185,7 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
         printf("Error: Failed to allocate host memory for token indices.\n");
         if (hostTokenIndices) free(hostTokenIndices);
         if (hostRightEndIndices) free(hostRightEndIndices);
+        if (instructRoot) cJSON_Delete(instructRoot);
         cJSON_Delete(root);
         free(jsonContent);
         return -1;
@@ -187,14 +206,36 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
             continue;
         }
         
+        // Build the instruct token prefix for this story (if enabled/available).
+        // These indices are prepended before the story's own tokens so the whole
+        // sequence is trained as one unit.
+        int instructTokens[TOKENS_PER_STORY];
+        int instructCount = 0;
+        if (instructRoot) {
+            int built = instructBuildTokens(instructRoot, storyIdx, instructTokens, TOKENS_PER_STORY);
+            if (built > 0) {
+                instructCount = built;
+            }
+        }
+        
+        // Remaining capacity for the story's own tokens after the instruct prefix.
+        int storyCapacity = TOKENS_PER_STORY - instructCount;
+        if (storyCapacity < 2) {
+            // Instruct prefix left no room for a meaningful story; drop the prefix.
+            instructCount = 0;
+            storyCapacity = TOKENS_PER_STORY;
+        }
+        
         // Calculate rightEndIndex: the last position from which a prediction can be made.
-        // We load up to TOKENS_PER_STORY (maxL+1) tokens. The token at rightEndIndex+1 is
-        // the target for the prediction at rightEndIndex.
+        // The combined sequence is [instruct tokens][story tokens], capped at
+        // TOKENS_PER_STORY (maxL+1). The token at rightEndIndex+1 is the target for
+        // the prediction at rightEndIndex.
         // Example: 30-token story → load 30, rightEndIndex = 28, L = 29
         // Example: 1000-token story (maxL=256) → load 257, rightEndIndex = 255, L = 256
-        int tokensToLoad = (storyTokenCount > TOKENS_PER_STORY) 
-                          ? TOKENS_PER_STORY 
+        int storyTokensToLoad = (storyTokenCount > storyCapacity)
+                          ? storyCapacity
                           : storyTokenCount;
+        int tokensToLoad = instructCount + storyTokensToLoad;
         int rightEndIndex = tokensToLoad - 2;
         if (rightEndIndex < 0) {
             printf("Warning: Story at index %d has fewer than 2 tokens, skipping.\n", storyIdx);
@@ -206,8 +247,13 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
         // Calculate base offset for this story in the token array
         int baseOffset = storiesLoaded * TOKENS_PER_STORY;
         
-        // Process tokens (up to tokensToLoad tokens)
-        int tokensToProcess = tokensToLoad;
+        // Copy the instruct prefix tokens first.
+        for (int i = 0; i < instructCount; i++) {
+            hostTokenIndices[baseOffset + i] = instructTokens[i];
+        }
+        
+        // Process story tokens (up to storyTokensToLoad tokens), placed after the prefix.
+        int tokensToProcess = storyTokensToLoad;
         
         bool tokenError = false;
         for (int tokenPos = 0; tokenPos < tokensToProcess && !tokenError; tokenPos++) {
@@ -227,7 +273,7 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
                 break;
             }
             
-            hostTokenIndices[baseOffset + tokenPos] = tokenIndex;
+            hostTokenIndices[baseOffset + instructCount + tokenPos] = tokenIndex;
         }
         
         if (tokenError) {
@@ -235,7 +281,7 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
         }
         
         // Pad remaining positions with padding token (~)
-        for (int tokenPos = tokensToProcess; tokenPos < TOKENS_PER_STORY; tokenPos++) {
+        for (int tokenPos = instructCount + tokensToProcess; tokenPos < TOKENS_PER_STORY; tokenPos++) {
             hostTokenIndices[baseOffset + tokenPos] = PADDING_TOKEN_INDEX;
         }
         
@@ -265,6 +311,7 @@ static int loadStoriesFromFile(const char* filePath, int* numStoriesOut) {
     hostRightEndIndices_storage = hostRightEndIndices;
     hostRightEndIndices_count = storiesLoaded;
     
+    if (instructRoot) cJSON_Delete(instructRoot);
     cJSON_Delete(root);
     free(jsonContent);
     
@@ -283,10 +330,12 @@ typedef struct {
 } SequenceLossResult;
 
 // Process a single sequence: run inference, compute loss, compute gradients
-// storyIndex: index into the loaded stories (0-based)
-// shouldPrint: if true, print token-by-token predictions
+// storyIndex:  index into the loaded stories (0-based)
+// computeLoss: if true, compute (and return) the sequence loss
+// printTokens: if true, print a token-by-token prediction preview
+//              (only the first 20 and last 20 positions). Requires computeLoss.
 // Returns: total loss and number of predictions for this sequence
-static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
+static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool printTokens) {
     // Get the rightEndIndex for this story (from host storage)
     int rightEndIndex = hostRightEndIndices_storage[storyIndex];
     int L = rightEndIndex + 1;  // Number of positions for inference (0..rightEndIndex)
@@ -310,8 +359,8 @@ static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
     float totalLoss = 0.0f;
     int numPredictions = 0;
     
-    // Compute loss only when printing (avoids costly device-to-host copy every iteration)
-    if (shouldPrint) {
+    // Compute loss only when requested (avoids costly device-to-host copy every iteration)
+    if (computeLoss) {
         // Copy token indices to host (needed for target lookup)
         cudaMemcpy(seqTokenIndices, 
                    trainingStoryTokens_DEVICE + storyOffset, 
@@ -325,7 +374,13 @@ static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
         cudaMemcpy(hostVocabSoftmax, vocabScores_postSoftmax_DEVICE, 
                    vocabSize * L * sizeof(float), cudaMemcpyDeviceToHost);
         
-        printf("\n--- Story %d Predictions (rightEndIndex = %d) ---\n", storyIndex, rightEndIndex);
+        // Only the first 20 and last 20 positions are printed as a preview.
+        int previewHead = 20;                          // print positions [0, 20)
+        int previewTailStart = rightEndIndex - 19;     // print positions [rightEndIndex-19, rightEndIndex]
+        if (printTokens) {
+            printf("\n--- Story %d prediction preview (first & last 20 of %d positions) ---\n",
+                   storyIndex, rightEndIndex + 1);
+        }
         
         // For each position from 0 to rightEndIndex, we predict the next token
         for (int pos = 0; pos <= rightEndIndex; pos++) {
@@ -333,9 +388,9 @@ static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
             int nextTokenIdx = seqTokenIndices[pos + 1];  // Target token
             
             // Skip padding predictions
-            if (nextTokenIdx == PADDING_TOKEN_INDEX) {
+            /*if (nextTokenIdx == PADDING_TOKEN_INDEX) {
                 continue;
-            }
+            }*/
             
             // Get softmax probability for the correct next token
             // vocabScores_postSoftmax is column-major: column 'pos' starts at pos * vocabSize
@@ -347,15 +402,18 @@ static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
             totalLoss += -logf(correctProb);
             numPredictions++;
             
-            char currentTokenStr[64];
-            char nextTokenStr[64];
-            getDisplayToken(currentTokenIdx, currentTokenStr, sizeof(currentTokenStr));
-            getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
-            printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
+            if (printTokens) {
+                if (pos < previewHead || pos >= previewTailStart) {
+                    char currentTokenStr[64];
+                    char nextTokenStr[64];
+                    getDisplayToken(currentTokenIdx, currentTokenStr, sizeof(currentTokenStr));
+                    getDisplayToken(nextTokenIdx, nextTokenStr, sizeof(nextTokenStr));
+                    printf("%s --> %s (%.2f%%)\n", currentTokenStr, nextTokenStr, correctProb * 100.0f);
+                } else if (pos == previewHead) {
+                    printf("   ... (%d positions omitted) ...\n", previewTailStart - previewHead);
+                }
+            }
         }
-        
-        float avgLoss = (numPredictions > 0) ? (totalLoss / numPredictions) : 0.0f;
-        printf("\n--- Sequence Loss: %.4f (over %d predictions) ---\n", avgLoss, numPredictions);
     }
     
     // ========================================================================
@@ -376,7 +434,7 @@ static SequenceLossResult processSequence(int storyIndex, bool shouldPrint) {
 // Learning rate warmup configuration
 #define LR_START 9e-6f        // Starting learning rate
 #define LR_END 1e-4f          // Final learning rate after warmup
-#define LR_WARMUP_STEPS 10000 // Number of iterations for warmup
+#define LR_WARMUP_STEPS 13000 // Number of iterations for warmup
 
 // Calculate learning rate with linear warmup
 static float getLearningRate(int iteration) {
@@ -392,6 +450,14 @@ int runTrainingLoop(void) {
     printf("\n========================================\n");
     printf("Starting Training Loop\n");
     printf("========================================\n\n");
+    
+    // Initialize instruct category metadata (used to build per-story prefixes).
+    if (USE_INSTRUCT_DATA) {
+        instructActive = (instructInit() == 0);
+        if (!instructActive) {
+            printf("Warning: Failed to initialize instruct metadata; disabling instruct prepend.\n");
+        }
+    }
     
     int fileIndex = 1;
     int totalStoriesProcessed = 0;
@@ -414,7 +480,7 @@ int runTrainingLoop(void) {
         
         // Load stories from this file
         int numStoriesLoaded = 0;
-        int result = loadStoriesFromFile(filePath, &numStoriesLoaded);
+        int result = loadStoriesFromFile(filePath, fileIndex, &numStoriesLoaded);
         
         if (result != 0) {
             printf("Error loading stories from %s, skipping to next file.\n", filePath);
@@ -433,8 +499,8 @@ int runTrainingLoop(void) {
                numStoriesLoaded, fileIndex, totalStoriesProcessed);
         
         // Rest period after loading new JSON to let GPU cool down
-        printf("Resting for 20 seconds...\n");
-        sleep(20);
+        printf("Resting for 10 seconds...\n");
+        sleep(10);
         
         // ====================================================================
         // TRAINING LOOP FOR THIS FILE'S STORIES
@@ -461,15 +527,28 @@ int runTrainingLoop(void) {
             double batchTotalLoss = 0.0;
             int batchTotalPredictions = 0;
             
+            // Per-story losses for printable batches (printed together after the
+            // token preview, so they are easy to read without story data in between).
+            float storyAvgLoss[TRAINING_BATCH_SIZE];
+            int storyNumPreds[TRAINING_BATCH_SIZE];
+            
             // Inner loop: process each story in the batch
             for (int storyIdxInBatch = 0; storyIdxInBatch < currentBatchSize; storyIdxInBatch++) {
                 int globalStoryIdx = batchStart + storyIdxInBatch;
                 
-                // Process sequence: inference + gradient computation
-                // Only print if this is a print batch
-                SequenceLossResult seqResult = processSequence(globalStoryIdx, shouldPrintThisBatch);
+                // Compute loss for every story in a printable batch, but only print the
+                // token preview for the last story in the batch.
+                bool isLastInBatch = (storyIdxInBatch == currentBatchSize - 1);
+                bool printTokensThisStory = shouldPrintThisBatch && isLastInBatch;
+                SequenceLossResult seqResult = processSequence(globalStoryIdx, shouldPrintThisBatch, printTokensThisStory);
                 batchTotalLoss += seqResult.totalLoss;
                 batchTotalPredictions += seqResult.numPredictions;
+                
+                if (shouldPrintThisBatch) {
+                    storyAvgLoss[storyIdxInBatch] = (seqResult.numPredictions > 0)
+                        ? (seqResult.totalLoss / seqResult.numPredictions) : 0.0f;
+                    storyNumPreds[storyIdxInBatch] = seqResult.numPredictions;
+                }
                 
                 // Accumulate gradients (reset on first item in batch)
                 bool isFirstInBatch = (storyIdxInBatch == 0);
@@ -477,6 +556,15 @@ int runTrainingLoop(void) {
                 
                 // Wait for user keypress before continuing (commented out for fast training)
                 // waitForKeypress();
+            }
+            
+            // Per-story losses for this batch (after the token preview above)
+            if (shouldPrintThisBatch) {
+                printf("\n--- Per-story losses (batch %d) ---\n", batchIdx + 1);
+                for (int s = 0; s < currentBatchSize; s++) {
+                    printf("Story %d: loss %.4f (%d preds)\n",
+                           batchStart + s, storyAvgLoss[s], storyNumPreds[s]);
+                }
             }
             
             // Update global cumulative loss (sampled: only from printed batches)
@@ -503,8 +591,8 @@ int runTrainingLoop(void) {
                 snprintf(saveFilePath, sizeof(saveFilePath), MODEL_SAVE_PATH, globalIterationCount);
                 saveModelWeights(saveFilePath, globalIterationCount);
             }
-            /*if (globalIterationCount > 0 && globalIterationCount % 50 == 0) {
-                // Rest period after every 50 batches to let GPU cool down
+            /*if (globalIterationCount > 0 && globalIterationCount % 30 == 0) {
+                // Rest period after every 30 batches to let GPU cool down
                 printf("Resting for 13 seconds...\n");
                 sleep(13);
             }*/
@@ -533,6 +621,11 @@ int runTrainingLoop(void) {
         free(hostRightEndIndices_storage);
         hostRightEndIndices_storage = nullptr;
         hostRightEndIndices_count = 0;
+    }
+    
+    if (instructActive) {
+        instructCleanup();
+        instructActive = false;
     }
     
     printf("\n========================================\n");

@@ -1,0 +1,84 @@
+[
+  {
+    "flatStoryIndex": 1153890,
+    "originalIndex": 0,
+    "originalFolder": "from_mistral_category_C_creative_model",
+    "originalFile": "victorian_stories_0102.json",
+    "elements": {
+      "Ending Disposition": [
+        " ambiguous",
+        " hope"
+      ],
+      "Supernatural Alignment": [
+        " malign",
+        " supernatural",
+        " power"
+      ],
+      "Social Rank Dynamics": [
+        " inevitable",
+        " scandal"
+      ]
+    }
+  },
+  {
+    "flatStoryIndex": 1153891,
+    "originalIndex": 1,
+    "originalFolder": "from_mistral_category_C_creative_model",
+    "originalFile": "victorian_stories_0102.json",
+    "elements": {
+      "Ending Disposition": [
+        " ruin"
+      ],
+      "Plot Reversal": [
+        " plot",
+        " reversal"
+      ],
+      "Supernatural Alignment": [
+        " malign",
+        " supernatural",
+        " power"
+      ]
+    }
+  },
+  {
+    "flatStoryIndex": 1153892,
+    "originalIndex": 2,
+    "originalFolder": "from_mistral_category_C_creative_model",
+    "originalFile": "victorian_stories_0102.json",
+    "elements": {
+      "Ending Disposition": [
+        " mysterious",
+        " transcendence"
+      ],
+      "Plot Reversal": [
+        " plot",
+        " reversal"
+      ],
+      "Supernatural Alignment": [
+        " malign",
+        " supernatural",
+        " power"
+      ]
+    }
+  },
+  {
+    "flatStoryIndex": 1153893,
+    "originalIndex": 3,
+    "originalFolder": "from_mistral_category_C_creative_model",
+    "originalFile": "victorian_stories_0102.json",
+    "elements": {
+      "Ending Disposition": [
+        " transformation"
+      ],
+      "Social Rank Dynamics": [
+        " open",
+        " secret"
+      ],
+      "Setting Opulence": [
+        " respectable",
+        " household",
+        " setting"
+      ]
+    }
+  }
+]

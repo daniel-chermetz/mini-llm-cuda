@@ -8,7 +8,7 @@
 // We load a number of tokens 1 longer than maxL so we'd have a prediction to make when standing at the maxL'th token
 #define TOKENS_PER_STORY (maxL + 1)
 // Padding token index (~)
-#define PADDING_TOKEN_INDEX 89
+#define PADDING_TOKEN_INDEX 72
 
 // Run the training loop
 // This function iterates through all tokenizedStories_XXXX.json files,
