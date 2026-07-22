@@ -432,6 +432,9 @@ int loadModel(const char* modelName) {
                             cudaMemcpy(*weightMap[w].devicePtr, weightMap[w].hostPtr, 
                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
                         }
+                    } else {
+                        printf("Error: Invalid metadata for PLE block %d 'pleEmbeddings'.\n", p);
+                        success = 0;
                     }
                 } else {
                     printf("Warning: Weight '%s' not found in block %d\n", weightMap[w].jsonKey, blockIdx);
@@ -459,6 +462,9 @@ int loadModel(const char* modelName) {
                             cudaMemcpy(*configWeightMap[w].devicePtr, configWeightMap[w].hostPtr, 
                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
                         }
+                    } else {
+                        printf("Error: Invalid metadata for PLE block %d 'pleWeights'.\n", p);
+                        success = 0;
                     }
                 } else {
                     printf("Warning: Weight '%s' not found in block %d\n", configWeightMap[w].jsonKey, blockIdx);
@@ -467,6 +473,91 @@ int loadModel(const char* modelName) {
         }
     }
     
+    // ========== Load perLayerEmbeddings (CONFIG_PLE) ==========
+    // Read after all transformer blocks, in the same order they were saved:
+    //   pleEmbeddings (dim x vocabSize) -> handled like tokenEmbeddings
+    //   pleWeights    (dim x dim)       -> handled like a transformer weight matrix
+    //   pleGamma      (dim)             -> handled like an RMS gamma vector
+    if (CONFIG_PLE && success) {
+        cJSON* pleBlocksArr = cJSON_GetObjectItem(root, "perLayerEmbeddings");
+        if (pleBlocksArr && cJSON_IsArray(pleBlocksArr)) {
+            int numPleBlocks = cJSON_GetArraySize(pleBlocksArr);
+            if (numPleBlocks != pleLayers) {
+                printf("Error: Model contains %d PLE layers, but this build requires %d.\n",
+                       numPleBlocks, pleLayers);
+                success = 0;
+            }
+            for (int p = 0; p < pleLayers && success; p++) {
+                printf("Loading PLE layer %d/%d...\n", p + 1, pleLayers);
+                cJSON* pleObj = cJSON_GetArrayItem(pleBlocksArr, p);
+                if (!pleObj) {
+                    printf("Error: Expected PLE block object.\n");
+                    success = 0;
+                    break;
+                }
+
+                // pleEmbeddings (dim x vocabSize) - transpose into device layout like tokenEmbeddings
+                cJSON* pleEmbObj = cJSON_GetObjectItem(pleObj, "pleEmbeddings");
+                if (pleEmbObj) {
+                    if (parseTensorMeta(pleEmbObj, &tensorMeta)) {
+                        float* tmpEmb = (float*)malloc(tensorMeta.numElements * sizeof(float));
+                        if (!tmpEmb || !readTensorColumnMajor(fileBuffer, &dataOffset, fileSize, &tensorMeta, tmpEmb)) {
+                            success = 0;
+                            if (tmpEmb) free(tmpEmb);
+                        } else {
+                            float* transposedEmb = transposeTensorColumnMajor(tmpEmb, vocabSize, dim);
+                            free(tmpEmb);
+                            cudaMemcpy(pleWeights_DEVICE[p].embedding_weights, transposedEmb,
+                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
+                            free(transposedEmb);
+                        }
+                    } else {
+                        printf("Error: Invalid metadata for PLE block %d 'pleGamma'.\n", p);
+                        success = 0;
+                    }
+                } else {
+                    printf("Error: 'pleEmbeddings' not found in PLE block %d\n", p);
+                    success = 0;
+                }
+
+                // pleWeights (dim x dim)
+                cJSON* pleWObj = cJSON_GetObjectItem(pleObj, "pleWeights");
+                if (pleWObj && success) {
+                    if (parseTensorMeta(pleWObj, &tensorMeta)) {
+                        if (!readTensorColumnMajor(fileBuffer, &dataOffset, fileSize, &tensorMeta, pleWeights[p].ple_weights)) {
+                            success = 0;
+                        } else {
+                            cudaMemcpy(pleWeights_DEVICE[p].ple_weights, pleWeights[p].ple_weights,
+                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
+                        }
+                    }
+                } else if (success) {
+                    printf("Error: 'pleWeights' not found in PLE block %d\n", p);
+                    success = 0;
+                }
+
+                // pleGamma (dim)
+                cJSON* pleGammaObj = cJSON_GetObjectItem(pleObj, "pleGamma");
+                if (pleGammaObj && success) {
+                    if (parseTensorMeta(pleGammaObj, &tensorMeta)) {
+                        if (!readTensorColumnMajor(fileBuffer, &dataOffset, fileSize, &tensorMeta, pleWeights[p].gamma_weights)) {
+                            success = 0;
+                        } else {
+                            cudaMemcpy(pleWeights_DEVICE[p].gamma_weights, pleWeights[p].gamma_weights,
+                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
+                        }
+                    }
+                } else if (success) {
+                    printf("Error: 'pleGamma' not found in PLE block %d\n", p);
+                    success = 0;
+                }
+            }
+        } else {
+            printf("Error: CONFIG_PLE is enabled but 'perLayerEmbeddings' is missing from the model file.\n");
+            success = 0;
+        }
+    }
+
     cJSON_Delete(root);
     free(headerJson);
     free(fileBuffer);

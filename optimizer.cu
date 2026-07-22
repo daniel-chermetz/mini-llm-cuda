@@ -124,7 +124,79 @@ __global__ void update_weights_per_adeamix_no_decay(float* weight, float* fastEM
     }
 }
 
-void apply_adeamix_optimizer(int iterationNum, float learningRate) {
+__global__ void ple_embeddings_update_optimizer_intermediates(
+	const int* unique_seqTokenIndices_batch,
+	float* fastEMA,
+	float* slowEMA,
+	float* variance,
+	float* grad,
+	const float BETA1_, 
+	const float BETA2_, 
+	const float BETA3_, 
+	const int batchSize, 
+	const int gradSize
+) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= gradSize) {
+    	return;
+    }
+    int sequenceIndex = index / dim;
+    int featureIndex = index - sequenceIndex * dim;
+    int embeddingTokenIndex = unique_seqTokenIndices_batch[sequenceIndex];
+    int gradIndex = embeddingTokenIndex * dim + featureIndex;
+
+    float averagedGrad = grad[gradIndex] / (float) batchSize;
+
+    fastEMA[gradIndex] = BETA1_ * fastEMA[gradIndex] + (1.0f - BETA1_) * averagedGrad;
+    slowEMA[gradIndex] = BETA3_ * slowEMA[gradIndex] + (1.0f - BETA3_) * averagedGrad;
+  	variance[gradIndex] = BETA2_ * variance[gradIndex] + (1.0f - BETA2_) * averagedGrad * averagedGrad;
+
+  	grad[gradIndex] = 0.0f;
+}
+
+__global__ void ple_update_weights_per_adeamix_no_decay(
+	const int* unique_seqTokenIndices_batch, 
+	float* weight, 
+	const float* fastEMA, 
+	const float* slowEMA, 
+	const float* variance, 
+	const float* beta1_pow_store, 
+	const float* beta2_pow_store, 
+	const float* beta3_pow_store, 
+	const float learningRate, 
+	const int iterationNum, 
+	const float ALPHA_, 
+	const int size
+) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) {
+    	return;
+    }
+
+    int sequenceIndex = index / dim;
+    int featureIndex = index - sequenceIndex * dim;
+    int embeddingTokenIndex = unique_seqTokenIndices_batch[sequenceIndex];
+    int weightIndex = embeddingTokenIndex * dim + featureIndex;
+
+    float fastEMABiased = fastEMA[weightIndex] / beta1_pow_store[iterationNum];
+    // float slowEMABiased = slowEMA[weightIndex] / beta3_pow_store[iterationNum];
+    float varianceBiasedFinal = sqrtf(variance[weightIndex] / beta2_pow_store[iterationNum]) + 1e-8f;
+    if (varianceBiasedFinal < 0.01f) {
+    	varianceBiasedFinal = 0.01f;
+    }
+
+    float momentum_final = fastEMABiased + ALPHA_ * slowEMA[weightIndex]; // slowEMABiased;
+    float momentum_variance_scaled_final = momentum_final / varianceBiasedFinal;
+    
+    float weightUpdate = learningRate * momentum_variance_scaled_final;
+    if (weightUpdate < 0.01f && weightUpdate > -0.01f) {
+		weight[weightIndex] = weight[weightIndex] - weightUpdate;
+    } else {
+		weight[weightIndex] = weight[weightIndex] - (weightUpdate / fabsf(weightUpdate / 0.01f));
+    }
+}
+
+void apply_adeamix_optimizer(int iterationNum, float learningRate, int batchTokenSize) {
 	int xTotalThreads;
 	int numBlocks;
 
@@ -191,7 +263,15 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate) {
 		if (CONFIG_QUERY_GATING) {
 			// Gated Query Weights (dim x dim)
 			update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(fastEMA[t].gated_query_weights, slowEMA[t].gated_query_weights, variance[t].gated_query_weights, gradientAccumulation[t].gated_query_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
-			update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].gated_query_weights, fastEMA[t].gated_query_weights, slowEMA[t].gated_query_weights, variance[t].gated_query_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);			
+			update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].gated_query_weights, fastEMA[t].gated_query_weights, slowEMA[t].gated_query_weights, variance[t].gated_query_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
+		}
+		if (CONFIG_PLE) {
+			int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[t];
+			if (pleIndex != -1) {
+				// PLE Weights (dim x dim)
+				update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(pleFastEMA[pleIndex].ple_weights, pleSlowEMA[pleIndex].ple_weights, pleVariance[pleIndex].ple_weights, pleGradientAccumulation[pleIndex].ple_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+				update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].ple_weights, pleFastEMA[pleIndex].ple_weights, pleSlowEMA[pleIndex].ple_weights, pleVariance[pleIndex].ple_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);				
+			}
 		}
 
 		// RMS1 Gamma Weights (dim)
@@ -208,6 +288,19 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate) {
 			// Key RMS Gamma Weights (dim)
 			update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(fastEMA[t].key_gamma_weights, slowEMA[t].key_gamma_weights, variance[t].key_gamma_weights, gradientAccumulation[t].key_gamma_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
 			update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].key_RMS_weights, fastEMA[t].key_gamma_weights, slowEMA[t].key_gamma_weights, variance[t].key_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);			
+        }
+        if (CONFIG_PLE) {
+        	int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[t];
+			if (pleIndex != -1) {
+				// PLE Gamma Weights (dim)
+				update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(pleFastEMA[pleIndex].gamma_weights, pleSlowEMA[pleIndex].gamma_weights, pleVariance[pleIndex].gamma_weights, pleGradientAccumulation[pleIndex].gamma_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+				update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].gamma_weights, pleFastEMA[pleIndex].gamma_weights, pleSlowEMA[pleIndex].gamma_weights, pleVariance[pleIndex].gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
+
+				xTotalThreads = batchTokenSize * dim;
+				numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+				ple_embeddings_update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(unique_seqTokenIndices_batch_DEVICE, pleFastEMA[pleIndex].embedding_weights, pleSlowEMA[pleIndex].embedding_weights, pleVariance[pleIndex].embedding_weights, ple_backpropCalculations[pleIndex].embedding_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+				ple_update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(unique_seqTokenIndices_batch_DEVICE, pleWeights_DEVICE[pleIndex].embedding_weights, pleFastEMA[pleIndex].embedding_weights, pleSlowEMA[pleIndex].embedding_weights, pleVariance[pleIndex].embedding_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+			}
         }
 	}
 }

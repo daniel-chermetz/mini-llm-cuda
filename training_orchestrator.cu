@@ -51,6 +51,11 @@
 static int* hostRightEndIndices_storage = nullptr;
 static int hostRightEndIndices_count = 0;
 
+// Host-side copy of the loaded stories' token indices (kept on host so the batch's
+// unique token set can be built for CONFIG_PLE embedding updates). Layout mirrors
+// trainingStoryTokens_DEVICE: [story * TOKENS_PER_STORY + position].
+static int* hostStoryTokens_storage = nullptr;
+
 // Host-side storage for leftStartIndices (first token position that contributes
 // gradients). With instruct prepended this is the last instruct token (the second
 // \n), so the instruct tokens themselves are not trained as prediction targets.
@@ -312,8 +317,12 @@ static int loadStoriesFromFile(const char* filePath, int fileIndex, int* numStor
                storiesLoaded, TOKENS_PER_STORY);
     }
     
-    // Cleanup token indices (no longer needed on host)
-    free(hostTokenIndices);
+    // Keep the host token indices around (needed to build the batch's unique token
+    // set for CONFIG_PLE embedding updates). Free any previous allocation first.
+    if (hostStoryTokens_storage != nullptr) {
+        free(hostStoryTokens_storage);
+    }
+    hostStoryTokens_storage = hostTokenIndices;
     
     // Keep rightEndIndices on host for easy access in inner loop
     // Free any previous allocation
@@ -471,7 +480,7 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
 
 // Learning rate warmup configuration
 #define LR_START 9e-6f        // Starting learning rate
-#define LR_END 1e-4f          // Final learning rate after warmup
+#define LR_END 3e-5f          // Final learning rate after warmup
 #define LR_WARMUP_STEPS 13000 // Number of iterations for warmup
 
 // Calculate learning rate with linear warmup
@@ -614,7 +623,39 @@ int runTrainingLoop(void) {
             // Apply optimizer after batch gradient accumulation
             globalIterationCount++;
             float currentLR = getLearningRate(globalIterationCount);
-            apply_adeamix_optimizer(globalIterationCount, currentLR);
+
+            // For CONFIG_PLE: accumulate the unique token indices touched across all of the
+            // batch's sequences (positions 0..rightEndIndex, matching grad_ple_embeddings)
+            // and upload them once so the optimizer only updates the PLE embedding rows that
+            // actually received gradient this batch.
+            int batchTokenSize = 0;
+            if (CONFIG_PLE) {
+                static char* pleTokenSeen = nullptr;
+                if (pleTokenSeen == nullptr) {
+                    pleTokenSeen = (char*)calloc(vocabSize, sizeof(char));
+                }
+                int uniqueCount = 0;
+                for (int s = batchStart; s < batchEnd; s++) {
+                    int rightEnd = hostRightEndIndices_storage[s];
+                    int base = s * TOKENS_PER_STORY;
+                    for (int pos = 0; pos <= rightEnd; pos++) {
+                        int tok = hostStoryTokens_storage[base + pos];
+                        if (tok >= 0 && tok < vocabSize && !pleTokenSeen[tok]) {
+                            pleTokenSeen[tok] = 1;
+                            unique_seqTokenIndices_batch[uniqueCount++] = tok;
+                        }
+                    }
+                }
+                // Reset only the flags we set (cheaper than clearing the whole vocab).
+                for (int i = 0; i < uniqueCount; i++) {
+                    pleTokenSeen[unique_seqTokenIndices_batch[i]] = 0;
+                }
+                cudaMemcpy(unique_seqTokenIndices_batch_DEVICE, unique_seqTokenIndices_batch,
+                           uniqueCount * sizeof(int), cudaMemcpyHostToDevice);
+                batchTokenSize = uniqueCount;
+            }
+
+            apply_adeamix_optimizer(globalIterationCount, currentLR, batchTokenSize);
             
             if (shouldPrintThisBatch) {
                 float batchAvgLoss = (batchTotalPredictions > 0) ? (float)(batchTotalLoss / batchTotalPredictions) : 0.0f;
@@ -663,6 +704,10 @@ int runTrainingLoop(void) {
     if (hostLeftStartIndices_storage != nullptr) {
         free(hostLeftStartIndices_storage);
         hostLeftStartIndices_storage = nullptr;
+    }
+    if (hostStoryTokens_storage != nullptr) {
+        free(hostStoryTokens_storage);
+        hostStoryTokens_storage = nullptr;
     }
     
     if (instructActive) {

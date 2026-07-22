@@ -282,6 +282,7 @@ __global__ void add_residual_path_upGrad_to_x_gradient(float* x_grad, float* out
     x_grad[index] += outputProjPlusResidual_upGrad[index];
 }
 
+// vocabSize_ NOT USED: can be removed
 __global__ void add_x_grad_to_embeddings_grad(float* embedding_weights_grad, float* x_grad, int* seqTokenIndicesInFullEmbeddings, int dim_, int vocabSize_, int rightEndIndex) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int max = dim_ * (rightEndIndex + 1);
@@ -436,6 +437,14 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	);	
 
 	for (int tIndex = 0; tIndex < transformers; tIndex++) {
+		if (CONFIG_PLE) {
+            int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[tIndex];
+            if (pleIndex != -1) {
+            	// getGradientsForPLELayerTraining(const int pleIndex, const int downstreamTransformerIndex, const int leftStartIndex, const int rightEndIndex, const int L)
+                getGradientsForPLELayerTraining(pleIndex, tIndex, leftStartIndex, rightEndIndex, L); // runPLEInference(int pleIndex, int downstreamTransformerIndex, int L)
+            }
+        }
+
 		// (dLoss/d_ffn_final) * (d_ffn_final/d_ffn_right_postHadamard)
 		// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
 		// transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard: [ffnDim, L],
@@ -1216,6 +1225,13 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			if (CONFIG_QUERY_GATING) {
 				cudaMemcpy(gradientAccumulation[transformerIndex].gated_query_weights, backpropCalculations[transformerIndex].gated_query_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
 			}
+			if (CONFIG_PLE) {
+				int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[transformerIndex];
+				if (pleIndex != -1) {
+					cudaMemcpy(pleGradientAccumulation[pleIndex].ple_weights, ple_backpropCalculations[pleIndex].ple_weights, dim * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+					cudaMemcpy(pleGradientAccumulation[pleIndex].gamma_weights, ple_backpropCalculations[pleIndex].gamma_weights, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+				}
+			}
     	}
 	} else {
 		int xTotalThreads = dim * vocabSize;
@@ -1242,6 +1258,12 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			if (CONFIG_QUERY_GATING) {
 				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].gated_query_weights, backpropCalculations[transformerIndex].gated_query_weights, dim * dim);
 			}
+			if (CONFIG_PLE) {
+				int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[transformerIndex];
+				if (pleIndex != -1) {
+					add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(pleGradientAccumulation[pleIndex].ple_weights, ple_backpropCalculations[pleIndex].ple_weights, dim * dim);
+				}
+			}
 
 			xTotalThreads = dim;
 			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
@@ -1250,6 +1272,12 @@ void accumulateGradientsFromLastTrainingStep(bool resetGradAccumulation) {
 			if (CONFIG_QK_RMS_NORM) {
 				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].key_gamma_weights, backpropCalculations[transformerIndex].key_gamma_weights, dim);
 				add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(gradientAccumulation[transformerIndex].query_gamma_weights, backpropCalculations[transformerIndex].query_gamma_weights, dim);
+			}
+			if (CONFIG_PLE) {
+				int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[transformerIndex];
+				if (pleIndex != -1) {
+					add_step_grads_to_batch_accumulation<<<numBlocks, threadsPerBlock>>>(pleGradientAccumulation[pleIndex].gamma_weights, ple_backpropCalculations[pleIndex].gamma_weights, dim);
+				}
 			}
 		}
 	}

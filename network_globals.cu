@@ -26,6 +26,11 @@ float* x_DEVICE = nullptr;
 
 TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
 
+// CONFIG_PLE weights and forward calculations
+PLEWeights pleWeights[pleLayers];
+PLEWeights pleWeights_DEVICE[pleLayers];
+PLECalculations_DEVICE pleCalculations_DEVICE[pleLayers];
+
 float* ffn_sumByCol_RMS_DEVICE = nullptr;
 float* ffn_postRMS_pre_gamma_DEVICE = nullptr;
 float* ffn_postRMS_post_gamma_DEVICE = nullptr;
@@ -54,6 +59,9 @@ float* ffn_final_oneOverColDimR3_byCol_RMS = nullptr;
 
 BackpropCalculations backpropCalculations[transformers];
 
+// CONFIG_PLE backprop calculations
+PLEBackpropCalculations ple_backpropCalculations[pleLayers];
+
 float* x_DEVICE_grad = nullptr;
 
 /*
@@ -80,6 +88,16 @@ OptimizerTransformerState slowEMA[transformers];
 float* variance_embedding_weights = nullptr;
 float* variance_final_RMS_gamma_weights = nullptr;
 OptimizerTransformerState variance[transformers];
+
+// CONFIG_PLE optimizer state (gradient accumulation, EMA, variance)
+PLEOptimizerState pleGradientAccumulation[pleLayers];
+PLEOptimizerState pleFastEMA[pleLayers];
+PLEOptimizerState pleSlowEMA[pleLayers];
+PLEOptimizerState pleVariance[pleLayers];
+
+// CONFIG_PLE: unique token indices touched across a whole batch (host + device)
+int* unique_seqTokenIndices_batch = nullptr;
+int* unique_seqTokenIndices_batch_DEVICE = nullptr;
 
 // Beta power stores for bias correction (precomputed 1 - beta^iteration)
 float* beta1_pow_store = nullptr;

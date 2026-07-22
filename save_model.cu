@@ -64,6 +64,15 @@ void saveModelWeights(const char* filename, int iterationNum) {
         }
     }
     
+    // Per-layer embedding (PLE) tensors
+    if (CONFIG_PLE) {
+        for (int p = 0; p < pleLayers; p++) {
+            totalElements += dim * vocabSize; // pleEmbeddings
+            totalElements += dim * dim;       // pleWeights
+            totalElements += dim;             // pleGamma
+        }
+    }
+    
     // Allocate host buffer for all weights
     float* hostBuffer = (float*)malloc(totalElements * sizeof(float));
     if (!hostBuffer) {
@@ -140,6 +149,31 @@ void saveModelWeights(const char* filename, int iterationNum) {
     }
     
     cJSON_AddItemToObject(metadata, "transformerBlocks", transformerBlocks);
+    
+    // Per-layer embedding (PLE) blocks. Written after all transformer blocks so the
+    // load path can read them in the same sequential order. Each entry mirrors the
+    // layout/handling of the corresponding transformer tensors:
+    //   pleEmbeddings -> like tokenEmbeddings (dim x vocabSize)
+    //   pleWeights    -> like a (dim x dim) weight matrix
+    //   pleGamma      -> like an RMS gamma vector (dim)
+    if (CONFIG_PLE) {
+        cJSON* pleBlocks = cJSON_CreateArray();
+        for (int p = 0; p < pleLayers; p++) {
+            cJSON* pleMeta = cJSON_CreateObject();
+
+            shape2D[0] = dim; shape2D[1] = vocabSize;
+            offset += addTensorToSave(pleMeta, "pleEmbeddings", pleWeights_DEVICE[p].embedding_weights, shape2D, 2, hostBuffer, offset);
+
+            shape2D[0] = dim; shape2D[1] = dim;
+            offset += addTensorToSave(pleMeta, "pleWeights", pleWeights_DEVICE[p].ple_weights, shape2D, 2, hostBuffer, offset);
+
+            shape1D[0] = dim;
+            offset += addTensorToSave(pleMeta, "pleGamma", pleWeights_DEVICE[p].gamma_weights, shape1D, 1, hostBuffer, offset);
+
+            cJSON_AddItemToArray(pleBlocks, pleMeta);
+        }
+        cJSON_AddItemToObject(metadata, "perLayerEmbeddings", pleBlocks);
+    }
     
     // Convert metadata to string
     char* headerString = cJSON_PrintUnformatted(metadata);

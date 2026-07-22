@@ -108,6 +108,7 @@ __global__ void applyRMSNormAcrossHeads(float* postRMS_post_gamma, float* postRM
 
     postRMS_pre_gamma[index] = (preRMS[index] / rmsSumByColByHead[sumIndex]);
     postRMS_post_gamma[index] = (rms_weights[rowIndex] * postRMS_pre_gamma[index]);
+    // postRMS_post_gamma[index] = postRMS_pre_gamma[index];
 }
 
 __global__ void applyRoPE(float* keysOrValuesPostRoPE, float* keysOrValues, float* preComputedRopeTheta, int headDim_, int dim_, int L_) {
@@ -384,10 +385,13 @@ int runInference(int L) {
     for (int tIndexCountUp = 0; tIndexCountUp < transformers; tIndexCountUp++) {
         int tIndex = transformers - 1 - tIndexCountUp;
 
+        int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[tIndex + 1];
+        bool consume_last_ple_result = (CONFIG_PLE && pleIndex != -1);
+
         if (tIndex == transformers - 1) {
             getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, x_DEVICE, dim);
         } else {
-            getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim);
+            getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, consume_last_ple_result ? pleCalculations_DEVICE[pleIndex].sum_ffnPlusResidual_x_ple_gated : transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim);
         }
 
         xTotalThreads = dim * L;
@@ -395,7 +399,7 @@ int runInference(int L) {
         if (tIndex == transformers - 1) {
             applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma, transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma, x_DEVICE, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
         } else {
-            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma, transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
+            applyRMSNorm<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma, transformerCalculations_DEVICE[tIndex].x_postRMS1_pre_gamma, consume_last_ple_result ? pleCalculations_DEVICE[pleIndex].sum_ffnPlusResidual_x_ple_gated : transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, transformerWeights_DEVICE[tIndex].rms1_weights, dim, L);
         }
 
         cublasGemmEx(
@@ -606,8 +610,8 @@ int runInference(int L) {
         if (tIndex == transformers - 1) {
             addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, x_DEVICE, dim, L);
         } else {
-            addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim, L);
-        }      
+            addResidualToOutputProj<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, transformerCalculations_DEVICE[tIndex].outputProj, consume_last_ple_result ? pleCalculations_DEVICE[pleIndex].sum_ffnPlusResidual_x_ple_gated : transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual, dim, L);
+        }
 
         getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].outputProjPlusResidual_sumByCol_RMS2, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, dim);
         xTotalThreads = dim * L;
@@ -697,6 +701,13 @@ int runInference(int L) {
         xTotalThreads = dim * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
         addResidualToFFN<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].ffnPlusResidual, transformerCalculations_DEVICE[tIndex].ffn_final, transformerCalculations_DEVICE[tIndex].outputProjPlusResidual, dim, L);
+
+        if (CONFIG_PLE) {
+            int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[tIndex];
+            if (pleIndex != -1) {
+                runPLEInference(pleIndex, tIndex, L); // runPLEInference(int pleIndex, int downstreamTransformerIndex, int L)
+            }
+        }
     }
 
     // char* filename_final_ffn_plus_residual = "final_FFN_plus_residual";

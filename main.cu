@@ -1,5 +1,5 @@
 /*
-nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
+nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network_globals.cu training.cu training_ple.cu \
      inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
      training_orchestrator.cu training_orchestrator_instruct_helper.cu optimizer.cu random_weights.cu save_model.cu \
      -o mini_llm_cuda \
@@ -7,7 +7,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu train
      -arch=sm_86
 */
 /*
-nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
+nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network_globals.cu training.cu training_ple.cu \
      inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
      training_orchestrator.cu training_orchestrator_instruct_helper.cu optimizer.cu random_weights.cu save_model.cu \
      -o mini_llm_cuda \
@@ -15,7 +15,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu train
      -arch=sm_89
 */
 /*
-nvcc main.cu ./cJSON/cJSON.c inference.cu load_model.cu network_globals.cu training.cu \
+nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network_globals.cu training.cu training_ple.cu \
      inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
      training_orchestrator.cu training_orchestrator_instruct_helper.cu optimizer.cu random_weights.cu save_model.cu \
      -o mini_llm_cuda \

@@ -107,6 +107,30 @@ void initializeRandomWeights(float range) {
         printf("  Transformer %d weights initialized\n", t);
     }
     
+    // CONFIG_PLE weights: ple_weights + embedding tables random; gamma to 1.0
+    // (gamma rests at 1.0 under the decay-relative-to-one optimizer, matching the RMS
+    // gamma convention).
+    if (CONFIG_PLE) {
+        for (int pleIndex = 0; pleIndex < pleLayers; pleIndex++) {
+            // ple_weights (dim x dim)
+            size = dim * dim;
+            numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+            initRandomWeights<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].ple_weights, size, range, seed++);
+
+            // embedding_weights (dim x vocabSize)
+            size = dim * vocabSize;
+            numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+            initRandomWeights<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].embedding_weights, size, range, seed++);
+
+            // gamma_weights (dim) - initialize to 1.0
+            size = dim;
+            numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+            initConstantWeights<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].gamma_weights, size, 1.0f);
+
+            printf("  PLE layer %d weights initialized\n", pleIndex);
+        }
+    }
+    
     cudaDeviceSynchronize();
     printf("=== Random Weight Initialization Complete ===\n\n");
 }

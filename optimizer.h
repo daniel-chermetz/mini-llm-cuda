@@ -7,4 +7,6 @@ __global__ void preCalcPowBeta(float* beta1_pow_store, float* beta2_pow_store, f
 // Apply AdEMAMix optimizer to all model weights
 // iterationNum: current iteration (starts at 1)
 // learningRate: learning rate for this step
-void apply_adeamix_optimizer(int iterationNum, float learningRate);
+// batchTokenSize: number of unique token indices touched across the batch (CONFIG_PLE
+//                 embedding updates); ignored when CONFIG_PLE is disabled
+void apply_adeamix_optimizer(int iterationNum, float learningRate, int batchTokenSize);

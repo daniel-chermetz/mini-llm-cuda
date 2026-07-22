@@ -196,6 +196,60 @@ static void allocateVarianceMemory() {
 }
 
 // ============================================================================
+// CONFIG_PLE TRAINING MEMORY (backprop buffers, optimizer state, unique tokens)
+// ============================================================================
+
+static void allocatePLETrainingMemory() {
+    for (int pleIndex = 0; pleIndex < pleLayers; pleIndex++) {
+        // Backprop (gradient) buffers
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].grad_x_ple, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].grad_ple_gate_post_sigmoid_post_gamma, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].grad_ple_gate_post_sigmoid_pre_gamma, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].grad_ple_gate_pre_sigmoid_pre_gamma, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].gamma_weights, dim * sizeof(float));
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].ple_weights, dim * dim * sizeof(float));
+        // PLE embedding gradient is accumulated across the batch via atomicAdd, so it
+        // must start at zero. The optimizer re-zeroes each batch's touched tokens after
+        // the step, keeping the buffer clean for subsequent batches.
+        cudaMalloc((void**)&ple_backpropCalculations[pleIndex].embedding_weights, dim * vocabSize * sizeof(float));
+        cudaMemset(ple_backpropCalculations[pleIndex].embedding_weights, 0, dim * vocabSize * sizeof(float));
+
+        // Gradient accumulation (ple_weights and gamma only; embeddings accumulate in the
+        // backprop buffer above and are read from there directly by the optimizer)
+        cudaMalloc((void**)&pleGradientAccumulation[pleIndex].ple_weights, dim * dim * sizeof(float));
+        cudaMalloc((void**)&pleGradientAccumulation[pleIndex].gamma_weights, dim * sizeof(float));
+
+        // Fast EMA / Slow EMA / Variance (zero-initialized)
+        cudaMalloc((void**)&pleFastEMA[pleIndex].ple_weights, dim * dim * sizeof(float));
+        cudaMemset(pleFastEMA[pleIndex].ple_weights, 0, dim * dim * sizeof(float));
+        cudaMalloc((void**)&pleFastEMA[pleIndex].gamma_weights, dim * sizeof(float));
+        cudaMemset(pleFastEMA[pleIndex].gamma_weights, 0, dim * sizeof(float));
+        cudaMalloc((void**)&pleFastEMA[pleIndex].embedding_weights, dim * vocabSize * sizeof(float));
+        cudaMemset(pleFastEMA[pleIndex].embedding_weights, 0, dim * vocabSize * sizeof(float));
+
+        cudaMalloc((void**)&pleSlowEMA[pleIndex].ple_weights, dim * dim * sizeof(float));
+        cudaMemset(pleSlowEMA[pleIndex].ple_weights, 0, dim * dim * sizeof(float));
+        cudaMalloc((void**)&pleSlowEMA[pleIndex].gamma_weights, dim * sizeof(float));
+        cudaMemset(pleSlowEMA[pleIndex].gamma_weights, 0, dim * sizeof(float));
+        cudaMalloc((void**)&pleSlowEMA[pleIndex].embedding_weights, dim * vocabSize * sizeof(float));
+        cudaMemset(pleSlowEMA[pleIndex].embedding_weights, 0, dim * vocabSize * sizeof(float));
+
+        cudaMalloc((void**)&pleVariance[pleIndex].ple_weights, dim * dim * sizeof(float));
+        cudaMemset(pleVariance[pleIndex].ple_weights, 0, dim * dim * sizeof(float));
+        cudaMalloc((void**)&pleVariance[pleIndex].gamma_weights, dim * sizeof(float));
+        cudaMemset(pleVariance[pleIndex].gamma_weights, 0, dim * sizeof(float));
+        cudaMalloc((void**)&pleVariance[pleIndex].embedding_weights, dim * vocabSize * sizeof(float));
+        cudaMemset(pleVariance[pleIndex].embedding_weights, 0, dim * vocabSize * sizeof(float));
+    }
+
+    // Unique token indices touched across a batch (host + device). Bounded above by the
+    // total number of token positions that can appear in one batch.
+    size_t uniqueTokens_size = (size_t)TRAINING_BATCH_SIZE * TOKENS_PER_STORY * sizeof(int);
+    unique_seqTokenIndices_batch = (int*)malloc(uniqueTokens_size);
+    cudaMalloc((void**)&unique_seqTokenIndices_batch_DEVICE, uniqueTokens_size);
+}
+
+// ============================================================================
 // TRAINING MEMORY ALLOCATION
 // ============================================================================
 
@@ -292,6 +346,11 @@ static void allocateTrainingMemory() {
     allocateFastMomentumMemory();
     allocateSlowMomentumMemory();
     allocateVarianceMemory();
+
+    // Allocate CONFIG_PLE training buffers and optimizer state
+    if (CONFIG_PLE) {
+        allocatePLETrainingMemory();
+    }
 
     // Allocate beta power stores (10M iterations capacity)
     // Index 0 is placeholder (iteration starts at 1 to avoid division by zero)
@@ -538,6 +597,50 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_right_postHadamard, ffnDim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_final, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffnPlusResidual, dim * maxL * sizeof(float));
+    }
+
+    // ========================================================================
+    // CONFIG_PLE weights (host mirror + device) and forward calculation buffers
+    // ========================================================================
+    if (CONFIG_PLE) {
+        for (int pleIndex = 0; pleIndex < pleLayers; pleIndex++) {
+            PLEWeights* plw = &pleWeights[pleIndex];
+            PLEWeights* plw_d = &pleWeights_DEVICE[pleIndex];
+
+            // ple_weights (dim x dim)
+            size_t ple_weights_size = dim * dim * sizeof(float);
+            plw->ple_weights = (float*)malloc(ple_weights_size);
+            for (int i = 0; i < dim * dim; i++) {
+                plw->ple_weights[i] = ((float)rand() / (float)RAND_MAX);
+            }
+            cudaMalloc((void**)&plw_d->ple_weights, ple_weights_size);
+            cudaMemcpy(plw_d->ple_weights, plw->ple_weights, ple_weights_size, cudaMemcpyHostToDevice);
+
+            // gamma_weights (dim)
+            size_t ple_gamma_size = dim * sizeof(float);
+            plw->gamma_weights = (float*)malloc(ple_gamma_size);
+            for (int i = 0; i < dim; i++) {
+                plw->gamma_weights[i] = ((float)rand() / (float)RAND_MAX);
+            }
+            cudaMalloc((void**)&plw_d->gamma_weights, ple_gamma_size);
+            cudaMemcpy(plw_d->gamma_weights, plw->gamma_weights, ple_gamma_size, cudaMemcpyHostToDevice);
+
+            // embedding_weights (dim x vocabSize)
+            size_t ple_embedding_size = dim * vocabSize * sizeof(float);
+            plw->embedding_weights = (float*)malloc(ple_embedding_size);
+            for (int i = 0; i < dim * vocabSize; i++) {
+                plw->embedding_weights[i] = ((float)rand() / (float)RAND_MAX);
+            }
+            cudaMalloc((void**)&plw_d->embedding_weights, ple_embedding_size);
+            cudaMemcpy(plw_d->embedding_weights, plw->embedding_weights, ple_embedding_size, cudaMemcpyHostToDevice);
+
+            // Forward calculation buffers (allocated at maxL capacity)
+            cudaMalloc((void**)&pleCalculations_DEVICE[pleIndex].x_ple, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&pleCalculations_DEVICE[pleIndex].ple_gate_pre_sigmoid_pre_gamma, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&pleCalculations_DEVICE[pleIndex].ple_gate_post_sigmoid_pre_gamma, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&pleCalculations_DEVICE[pleIndex].ple_gate_post_sigmoid_post_gamma, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&pleCalculations_DEVICE[pleIndex].sum_ffnPlusResidual_x_ple_gated, dim * maxL * sizeof(float));
+        }
     }
 
     // Final output buffers (allocated at maxL capacity)

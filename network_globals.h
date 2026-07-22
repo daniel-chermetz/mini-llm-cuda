@@ -133,6 +133,48 @@ typedef struct {
     float* gated_query_weights;
 } OptimizerTransformerState;
 
+// ============================================================================
+// CONFIG_PLE (Per-Layer Embedding) structures
+// A PLE layer sits between two transformers. It looks up its own embedding table
+// for the sequence tokens (x_ple), gates the combined (token embedding + PLE
+// embedding) signal, and adds it onto the upstream transformer's output before
+// feeding the downstream transformer.
+// ============================================================================
+
+// PLE weights (host mirror + device)
+typedef struct {
+    float* ple_weights;       // [dim, dim]     projection producing the pre-sigmoid gate
+    float* gamma_weights;     // [dim]          per-feature gate scale
+    float* embedding_weights; // [dim, vocabSize] PLE-specific token embedding table
+} PLEWeights;
+
+// PLE forward calculation buffers (implicitly on Device)
+typedef struct {
+    float* x_ple;                            // [dim, maxL] PLE embeddings for the sequence
+    float* ple_gate_pre_sigmoid_pre_gamma;   // [dim, maxL]
+    float* ple_gate_post_sigmoid_pre_gamma;  // [dim, maxL]
+    float* ple_gate_post_sigmoid_post_gamma; // [dim, maxL]
+    float* sum_ffnPlusResidual_x_ple_gated;  // [dim, maxL] output fed to next transformer
+} PLECalculations_DEVICE;
+
+// PLE backprop calculation buffers (implicitly gradients, on Device)
+typedef struct {
+    float* grad_x_ple;                            // [dim, maxL]
+    float* grad_ple_gate_post_sigmoid_post_gamma; // [dim, maxL]
+    float* grad_ple_gate_post_sigmoid_pre_gamma;  // [dim, maxL]
+    float* grad_ple_gate_pre_sigmoid_pre_gamma;   // [dim, maxL]
+    float* gamma_weights;      // [dim]            gradient
+    float* ple_weights;        // [dim, dim]       gradient
+    float* embedding_weights;  // [dim, vocabSize] gradient (accumulated across the batch via atomicAdd)
+} PLEBackpropCalculations;
+
+// PLE optimizer state (gradient accumulation, EMA, variance)
+typedef struct {
+    float* ple_weights;       // [dim, dim]
+    float* gamma_weights;     // [dim]
+    float* embedding_weights; // [dim, vocabSize]
+} PLEOptimizerState;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -162,6 +204,17 @@ extern float* preComputedRopeTheta_DEVICE;
 extern float* x_DEVICE;
 
 extern TransformerCalculations_DEVICE transformerCalculations_DEVICE[transformers];
+
+// CONFIG_PLE weights and forward calculations
+extern PLEWeights pleWeights[pleLayers];
+extern PLEWeights pleWeights_DEVICE[pleLayers];
+extern PLECalculations_DEVICE pleCalculations_DEVICE[pleLayers];
+
+// PLE forward/backward entry points. Kept here because inference.cu and
+// training.cu already include this shared declaration header.
+int runPLEInference(int pleIndex, int downstreamTransformerIndex, int L);
+void getGradientsForPLELayerTraining(int pleIndex, int downstreamTransformerIndex,
+                                     int leftStartIndex, int rightEndIndex, int L);
 
 extern float* ffn_sumByCol_RMS_DEVICE;
 extern float* ffn_postRMS_pre_gamma_DEVICE;
@@ -193,6 +246,9 @@ extern float* x_DEVICE_grad;
 
 extern BackpropCalculations backpropCalculations[transformers];
 
+// CONFIG_PLE backprop calculations
+extern PLEBackpropCalculations ple_backpropCalculations[pleLayers];
+
 /*
 ### OPTIMIZER STATE ###
 (implicitly on Device)
@@ -217,6 +273,18 @@ extern OptimizerTransformerState slowEMA[transformers];
 extern float* variance_embedding_weights;
 extern float* variance_final_RMS_gamma_weights;
 extern OptimizerTransformerState variance[transformers];
+
+// CONFIG_PLE optimizer state (gradient accumulation, EMA, variance)
+extern PLEOptimizerState pleGradientAccumulation[pleLayers];
+extern PLEOptimizerState pleFastEMA[pleLayers];
+extern PLEOptimizerState pleSlowEMA[pleLayers];
+extern PLEOptimizerState pleVariance[pleLayers];
+
+// CONFIG_PLE: unique token indices touched across a whole batch (host + device).
+// Uploaded once per batch (after all sequences run) before the optimizer step so the
+// PLE embedding tables are only updated for the tokens that actually appeared.
+extern int* unique_seqTokenIndices_batch;
+extern int* unique_seqTokenIndices_batch_DEVICE;
 
 // Beta power stores for bias correction (precomputed 1 - beta^iteration)
 extern float* beta1_pow_store;
