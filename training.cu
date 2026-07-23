@@ -437,12 +437,21 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	);	
 
 	for (int tIndex = 0; tIndex < transformers; tIndex++) {
+		float* ffnPlusResidualFromDownstreamForward = 
+			(tIndex == (transformers - 1) ?
+				x_DEVICE :
+				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
+			);
 		if (CONFIG_PLE) {
             int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[tIndex];
             if (pleIndex != -1) {
             	// getGradientsForPLELayerTraining(const int pleIndex, const int downstreamTransformerIndex, const int leftStartIndex, const int rightEndIndex, const int L)
                 getGradientsForPLELayerTraining(pleIndex, tIndex, leftStartIndex, rightEndIndex, L); // runPLEInference(int pleIndex, int downstreamTransformerIndex, int L)
             }
+            int pleIndexNextDownstreamTransformer = CONFIG_PLE_post_transformer_by_tIndex[tIndex + 1];
+            if (pleIndexNextDownstreamTransformer != -1) {
+       			ffnPlusResidualFromDownstreamForward = pleCalculations_DEVICE[pleIndexNextDownstreamTransformer].sum_ffnPlusResidual_x_ple_gated;
+       		}
         }
 
 		// (dLoss/d_ffn_final) * (d_ffn_final/d_ffn_right_postHadamard)
@@ -1137,10 +1146,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 			backpropCalculations[tIndex].rms1_sigma_scale_x_upGrad_byCol_RMS, 
 			backpropCalculations[tIndex].rms1_oneOverR_byCol_RMS, 
 			backpropCalculations[tIndex].rms1_oneOverColDimR3_byCol_RMS, 
-			(tIndex == (transformers - 1) ?
-				x_DEVICE :
-				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
-			),
+			ffnPlusResidualFromDownstreamForward,
 			transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1,
 			transformerWeights_DEVICE[tIndex].rms1_weights, 
 			backpropCalculations[tIndex].x_postRMS1_post_gamma, 
@@ -1153,10 +1159,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 				x_DEVICE_grad :
 				backpropCalculations[tIndex + 1].ffn_final_plus_residual
 			),
-			(tIndex == (transformers - 1) ?
-				x_DEVICE :
-				transformerCalculations_DEVICE[tIndex + 1].ffnPlusResidual
-			),
+			ffnPlusResidualFromDownstreamForward,
 			backpropCalculations[tIndex].rms1_sigma_scale_x_upGrad_byCol_RMS, 
 			backpropCalculations[tIndex].rms1_oneOverR_byCol_RMS, 
 			backpropCalculations[tIndex].rms1_oneOverColDimR3_byCol_RMS, 

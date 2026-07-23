@@ -432,9 +432,6 @@ int loadModel(const char* modelName) {
                             cudaMemcpy(*weightMap[w].devicePtr, weightMap[w].hostPtr, 
                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
                         }
-                    } else {
-                        printf("Error: Invalid metadata for PLE block %d 'pleEmbeddings'.\n", p);
-                        success = 0;
                     }
                 } else {
                     printf("Warning: Weight '%s' not found in block %d\n", weightMap[w].jsonKey, blockIdx);
@@ -462,9 +459,6 @@ int loadModel(const char* modelName) {
                             cudaMemcpy(*configWeightMap[w].devicePtr, configWeightMap[w].hostPtr, 
                                       tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
                         }
-                    } else {
-                        printf("Error: Invalid metadata for PLE block %d 'pleWeights'.\n", p);
-                        success = 0;
                     }
                 } else {
                     printf("Warning: Weight '%s' not found in block %d\n", configWeightMap[w].jsonKey, blockIdx);
@@ -512,7 +506,7 @@ int loadModel(const char* modelName) {
                             free(transposedEmb);
                         }
                     } else {
-                        printf("Error: Invalid metadata for PLE block %d 'pleGamma'.\n", p);
+                        printf("Error: Invalid metadata for PLE block %d 'pleEmbeddings'.\n", p);
                         success = 0;
                     }
                 } else {
@@ -530,6 +524,9 @@ int loadModel(const char* modelName) {
                             cudaMemcpy(pleWeights_DEVICE[p].ple_weights, pleWeights[p].ple_weights,
                                        tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
                         }
+                    } else {
+                        printf("Error: Invalid metadata for PLE block %d 'pleWeights'.\n", p);
+                        success = 0;
                     }
                 } else if (success) {
                     printf("Error: 'pleWeights' not found in PLE block %d\n", p);
@@ -546,6 +543,9 @@ int loadModel(const char* modelName) {
                             cudaMemcpy(pleWeights_DEVICE[p].gamma_weights, pleWeights[p].gamma_weights,
                                        tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
                         }
+                    } else {
+                        printf("Error: Invalid metadata for PLE block %d 'pleGamma'.\n", p);
+                        success = 0;
                     }
                 } else if (success) {
                     printf("Error: 'pleGamma' not found in PLE block %d\n", p);
