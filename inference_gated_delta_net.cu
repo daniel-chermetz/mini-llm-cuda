@@ -291,58 +291,91 @@ __global__ void run_state_update_loop_v2(
 	const int chunk_L,
 	const int L
 ) {
-	int headIndex = blockIdx.x;
-	int blockDim = blockDim.x;
 	int tIndex = threadIdx.x;
-
-	// [chunk_L, headDim] * [headDim, chunk_L] = [chunk_L, chunk_L]
-	int maxChunkSize = chunk_L * chunk_L;
+	int numBlockThreads = blockDim.x;
 	int numChunks = (L + chunk_L - 1) / chunk_L;	
- 	int headStartRowOffset = headIndex * headDim;
- 	int headMatmulOutOffset = headIndex * numChunks * maxChunkSize;
+	int headIndex = blockIdx.x;
+	int headStartRowOffset = headIndex * headDim;
 
- 	for (int chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
- 		int keys_chunk_col_offset = chunkIndex * chunk_L;
- 		
- 		int local_chunk_L = keys_chunk_col_offset + chunk_L > L ? L - keys_chunk_col_offset : chunk_L;
- 		if (local_chunk_L == 0) {
- 			break;
- 		}
+	for (int chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
+	 	int keys_chunk_col_offset = chunkIndex * chunk_L;
+	 	int keys_chunk_offset = chunkIndex * chunk_L * dim;
 
- 		int maxLocalChunkSize = local_chunk_L * local_chunk_L;
- 		int indices_per_thread = (maxLocalChunkSize + blockDim - 1) / blockDim;
- 		int keys_chunk_offset = chunkIndex * chunk_L * dim;
- 		int keys_matmul_out_chunk_offset = headMatmulOutOffset + chunkIndex * maxChunkSize;
-		int keys_matmul_out_index = indices_per_thread * tIndex;
+	 	int local_chunk_L = keys_chunk_col_offset + chunk_L > L ? L - keys_chunk_col_offset : chunk_L;
+	 	if (local_chunk_L == 0) {
+	 		continue;
+	 	}
 
-		int col_index = keys_matmul_out_index / local_chunk_L;
-		int row_index = keys_matmul_out_index - col_index * local_chunk_L;
+		if (true) {
+			// [chunk_L, headDim] * [headDim, chunk_L] = [chunk_L, chunk_L]
+			int maxChunkSize = chunk_L * chunk_L;
+		 	int headMatmulOutOffset = headIndex * maxChunkSize;
 
-		int proj_offset = col_index * chunk_L + row_index;
+	 		int maxLocalChunkSize = local_chunk_L * local_chunk_L;
+	 		int indices_per_thread = (maxLocalChunkSize + numBlockThreads - 1) / numBlockThreads;
+			int keys_matmul_out_index = indices_per_thread * tIndex;
 
-		int keys_offset = keys_chunk_offset + col_index * dim + headStartRowOffset;
-		int keys_transposed_offset = keys_chunk_offset + row_index * dim + headStartRowOffset;
+			int col_index = keys_matmul_out_index / local_chunk_L;
+			int row_index = keys_matmul_out_index - col_index * local_chunk_L;
 
-		for (int i = 0; i < indices_per_thread; i++) {
-			if (keys_matmul_out_index >= maxLocalChunkSize) {
-				break; // break because the kernel has more work after this mathmul
+			int proj_offset = col_index * chunk_L + row_index;
+
+			int keys_offset = keys_chunk_offset + col_index * dim + headStartRowOffset;
+			int keys_transposed_offset = keys_chunk_offset + row_index * dim + headStartRowOffset;
+
+			for (int i = 0; i < indices_per_thread; i++) {
+				if (keys_matmul_out_index >= maxLocalChunkSize) {
+					break; // break because the kernel has more work after this mathmul
+				}
+
+				float keys_dot_product = 0.0f;
+				for (int j = 0; j < headDim; j++) {
+					keys_dot_product += keys[keys_transposed_offset + j] * keys[keys_offset + j];
+				}
+				keys_matmul[headMatmulOutOffset + proj_offset] = keys_dot_product;
+
+				keys_matmul_out_index++;
+				
+				col_index = keys_matmul_out_index / local_chunk_L;
+				row_index = keys_matmul_out_index - col_index * local_chunk_L;
+				proj_offset = col_index * chunk_L + row_index;
+
+				keys_offset = keys_chunk_offset + col_index * dim + headStartRowOffset;
+				keys_transposed_offset = keys_chunk_offset + row_index * dim + headStartRowOffset;
 			}
-
-			float keys_dot_product = 0.0f;
-			for (int j = 0; j < headDim; j++) {
-				keys_dot_product += keys[keys_transposed_offset + j] * keys[keys_offset + j];
-			}
-			keys_matmul[keys_matmul_out_chunk_offset + proj_offset] = keys_dot_product;
-
-			keys_matmul_out_index++;
-			
-			col_index = keys_matmul_out_index / local_chunk_L;
-			row_index = keys_matmul_out_index - col_index * local_chunk_L;
-
-			proj_offset = col_index * chunk_L + row_index;
-
-			keys_offset = keys_chunk_offset + col_index * dim + headStartRowOffset;
-			keys_transposed_offset = keys_chunk_offset + row_index * dim + headStartRowOffset;
 		}
+
+		if (chunkIndex > 0) {
+			// state [headDim, headDim]
+			// state [headDim, headDim] * keys [headDim, local_chunk_L] = [headDim, local_chunk_L]		
+			int maxChunkSize = headDim * chunk_L;
+			int maxLocalChunkSize = headDim * local_chunk_L;
+			int indices_per_thread = (maxLocalChunkSize + numBlockThreads - 1) / numBlockThreads;
+			int headMatmulOutOffset = headIndex * maxChunkSize; 			
+			int state_keys_matmul_out_index = indices_per_thread * tIndex;
+
+			for (int i = 0; i < indices_per_thread; i++) {
+				if (state_keys_matmul_out_index >= maxLocalChunkSize) {
+					break;
+				}
+
+				int col_index = state_keys_matmul_out_index / headDim;
+				int row_index = state_keys_matmul_out_index - col_index * headDim;
+				int proj_offset = col_index * headDim + row_index;
+
+				int state_row_offset = headStartRowOffset + row_index;
+				int keys_offset = keys_chunk_offset + col_index * dim + headStartRowOffset;
+
+				float state_keys_dot_product = 0.0f;
+				for (int j = 0; j < headDim; j++) {
+					state_keys_dot_product += state[state_row_offset + j * dim] * keys[keys_offset + j];
+				}
+				state_keys_matmul[headMatmulOutOffset + proj_offset] = state_keys_dot_product;
+
+				state_keys_matmul_out_index++;
+			}
+		}
+
+		__syncthreads();
 	}
 }
