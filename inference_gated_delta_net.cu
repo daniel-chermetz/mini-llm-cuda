@@ -203,6 +203,95 @@ __global__ void run_state_update_loop(
 	*/
 }
 
+__global__ void unwind_state_update_loop(
+	float* output_grad,
+	float* state_grad,
+	float* keys_grad,
+	float* values_grad,
+	float* queries_grad,
+	float* alpha_gate_grad,	
+	float* state,
+	float* keys,
+	float* values,
+	float* queries,
+	float* alpha_gate,
+	float* beta_gate,
+	int numAttnHeads,
+	int headDim,
+	int dim,
+	int L
+) {
+	int numBlockThreads = blockDim.x;
+	int headIndex = blockIdx.x;
+	int tIndex = threadIdx.x;
+
+	int stateSize = headDim * headDim;
+	int state_indices_per_thread = (stateSize + numBlockThreads - 1) / numBlockThreads;
+
+	int head_start_row_offset = headIndex * headDim;
+	int state_head_offset = head_start_row_offset * headDim;
+	int state_token_offset = stateSize * numAttnHeads;
+
+	for (int token_index = L - 1; token_index >= 0; token_index--) {
+		int state_feature = state_indices_per_thread * tIndex;
+
+		int token_col_and_head_row_offset = token_index * dim + head_start_row_offset;
+		
+		int gateIndex = headIndex * L + token_index;
+		float token_alpha = token_index < (L - 1) ? alpha_gate[gateIndex + 1] : 0.0f;
+		float token_beta = beta_gate[gateIndex];
+		float current_token_alpha_grad = 0.0f;
+
+		for (int i = 0; i < state_indices_per_thread; i++) {
+			if (state_feature >= stateSize) {
+				break;
+			}
+
+			int col = state_feature / headDim;
+			int row = state_feature - col * headDim;
+
+			int state_grad_index = state_head_offset + state_feature;
+			// output_grad given to the kernel, state_grad is headDim*headDim
+			float current_state_grad_val = output_grad[token_col_and_head_row_offset + row] * queries[token_col_and_head_row_offset + col];
+			float past_state_grad_val = state_grad[state_grad_index]; // state_grad initialized as zero
+			state_grad[state_grad_index] = (current_state_grad_val + token_alpha * past_state_grad_val);
+			current_token_alpha_grad += state[state_token_offset * token_index + state_grad_index] * past_state_grad_val;
+
+			state_feature++;
+		}
+
+		if (token_index < (L - 1)) {		
+			atomicAdd(&alpha_gate_grad[gateIndex + 1], current_token_alpha_grad);
+		}
+
+		__syncthreads();
+
+		if (tIndex < headDim) {
+			// beta * V * K^t with the state grad serving the upstream			
+			int tIndex_global_offset = token_col_and_head_row_offset + tIndex;
+
+			float current_token_keys_grad = 0.0f;
+			float current_token_values_grad = 0.0f;
+			for (int feature_index = 0; feature_index < headDim; feature_index++) {
+				int feature_index_global_offset = token_col_and_head_row_offset + feature_index;
+
+				current_token_values_grad += (keys[feature_index_global_offset] * state_grad[state_head_offset + tIndex + feature_index * headDim]); // row of the state
+				current_token_keys_grad += (values[feature_index_global_offset] * state_grad[state_head_offset + tIndex * headDim + feature_index]); // col of the state
+			}
+
+			keys_grad[tIndex_global_offset] = token_beta * current_token_keys_grad;
+			values_grad[tIndex_global_offset] = token_beta * current_token_values_grad;
+		}
+
+		__syncthreads();
+	}
+}
+
+
+// Beta column is applied over a column of V and both transposed.
+// Thus changing a feature in V^t scales by the same beta^t feature of the same token
+// And changing a feature in K, scales by the same beta^t feature as the V^t feature making the gradient
+
 St = St-1 + (-St-1 * Kt + Vt) * Kt_transposed
 
 delta_t = -St-1 * Kt + Vt
@@ -292,7 +381,10 @@ __global__ void run_state_update_loop_v2(
 ) {
 	int tIndex = threadIdx.x;
 	int numBlockThreads = blockDim.x;
-	int numChunks = (L + chunk_L - 1) / chunk_L;	
+	int numChunks = (L + chunk_L - 1) / chunk_L;
+
+	int stateSize = headDim * headDim;
+	int state_indices_per_thread = (stateSize + numBlockThreads - 1) / numBlockThreads;
 
 	int headIndex = blockIdx.x;
 	int headStartRowOffset = headIndex * headDim;
@@ -314,8 +406,8 @@ __global__ void run_state_update_loop_v2(
 
 	 	int maxLocalChunkSize = local_chunk_L * local_chunk_L;
 	 	int indices_per_thread = (maxLocalChunkSize + numBlockThreads - 1) / numBlockThreads;
-		int keys_matmul_out_index = indices_per_thread * tIndex;
 
+		int keys_matmul_out_index = indices_per_thread * tIndex;
 		for (int i = 0; i < indices_per_thread; i++) {
 			if (keys_matmul_out_index >= maxLocalChunkSize) {
 				break; // break because the kernel has more work after this mathmul
@@ -343,12 +435,10 @@ __global__ void run_state_update_loop_v2(
 			keys_matmul_out_index++;
 		}
 
-		// state [headDim, headDim]
-		// state [headDim, headDim] * keys [headDim, local_chunk_L] = [headDim, local_chunk_L]
+		// state [headDim, headDim] * keys [headDim, local_chunk_L] -> [headDim, local_chunk_L]
 		maxLocalChunkSize = headDim * local_chunk_L;
 		indices_per_thread = (maxLocalChunkSize + numBlockThreads - 1) / numBlockThreads;
 		int state_keys_matmul_out_index = indices_per_thread * tIndex;
-
 		for (int i = 0; i < indices_per_thread; i++) {
 			if (state_keys_matmul_out_index >= maxLocalChunkSize) {
 				break;
@@ -397,6 +487,7 @@ __global__ void run_state_update_loop_v2(
 
 		// U [headDim, L] * B_masked [L, L] -> Output [headDim, L]
 		int output_matmul_out_index = indices_per_thread * tIndex;
+		int stateSize = headDim * headDim;
 		for (int i = 0; i < indices_per_thread; i++) {
 			if (output_matmul_out_index >= maxLocalChunkSize) {
 				break;
@@ -419,5 +510,28 @@ __global__ void run_state_update_loop_v2(
 		}
 
 		// U [headDim, L] * K^T [L, headDim] -> Snext[headDim, headDim]
+		int state_matmul_out_index = state_indices_per_thread * tIndex;
+		for (int i = 0; i < state_indices_per_thread; i++) {
+			if (state_matmul_out_index >= stateSize) {
+				break;
+			}
+
+			int col_index = state_matmul_out_index / headDim;
+			int row_index = state_matmul_out_index - col_index * headDim;
+			int proj_offset = col_index * dim + headStartRowOffset + row_index;
+
+			int u_deltas_row_offset = headOffset_headDim_L + row_index;
+			int keys_transposed_offset = chunk_offset + headStartRowOffset + col_index;
+
+			float state_dot_product = 0.0f;
+			for (int j = 0; j < local_chunk_L; j++) {
+				state_dot_product += u_deltas[u_deltas_row_offset + j * headDim] * keys[keys_transposed_offset + j * dim];
+			}
+			state[proj_offset] += state_dot_product;
+
+			state_matmul_out_index++;
+		}
+
+		__syncthreads();
 	}
 }
