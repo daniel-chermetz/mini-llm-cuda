@@ -236,6 +236,8 @@ __global__ void unwind_state_update_loop(
 		int state_feature = state_indices_per_thread * tIndex;
 
 		int token_col_and_head_row_offset = token_index * dim + head_start_row_offset;
+
+		// state_token_offset * token_index - can save it here as I'm using it twice
 		
 		int gateIndex = headIndex * L + token_index;
 		float token_alpha = token_index < (L - 1) ? alpha_gate[gateIndex + 1] : 0.0f;
@@ -254,7 +256,9 @@ __global__ void unwind_state_update_loop(
 			// output_grad given to the kernel, state_grad is headDim*headDim
 			float current_state_grad_val = output_grad[token_col_and_head_row_offset + row] * queries[token_col_and_head_row_offset + col];
 			float past_state_grad_val = state_grad[state_grad_index]; // state_grad initialized as zero
+
 			state_grad[state_grad_index] = (current_state_grad_val + token_alpha * past_state_grad_val);
+			
 			current_token_alpha_grad += state[state_token_offset * token_index + state_grad_index] * past_state_grad_val;
 
 			state_feature++;
@@ -272,21 +276,26 @@ __global__ void unwind_state_update_loop(
 
 			float current_token_keys_grad = 0.0f;
 			float current_token_values_grad = 0.0f;
+			float current_token_queries_grad = 0.0f;
 			for (int feature_index = 0; feature_index < headDim; feature_index++) {
 				int feature_index_global_offset = token_col_and_head_row_offset + feature_index;
 
-				current_token_values_grad += (keys[feature_index_global_offset] * state_grad[state_head_offset + tIndex + feature_index * headDim]); // row of the state
 				current_token_keys_grad += (values[feature_index_global_offset] * state_grad[state_head_offset + tIndex * headDim + feature_index]); // col of the state
+				current_token_values_grad += (keys[feature_index_global_offset] * state_grad[state_head_offset + tIndex + feature_index * headDim]); // row of the state
+				current_token_queries_grad += (
+					state[state_token_offset * token_index + state_head_offset + headDim * tIndex + feature_index] 
+					* output_grad[feature_index_global_offset]
+				);
 			}
 
 			keys_grad[tIndex_global_offset] = token_beta * current_token_keys_grad;
 			values_grad[tIndex_global_offset] = token_beta * current_token_values_grad;
+			queries_grad[tIndex_global_offset] = current_token_queries_grad;
 		}
 
 		__syncthreads();
 	}
 }
-
 
 // Beta column is applied over a column of V and both transposed.
 // Thus changing a feature in V^t scales by the same beta^t feature of the same token
