@@ -153,8 +153,10 @@ __global__ void scale_attention_by_head(
 __global__ void compute_scaled_attention_grad_sums_across_rows_and_cols(
 	float* colGradSums,
 	float* rowGradSums,
+	float* beta_grad,
 	const float* upgrad_scaled_attention,
 	const float* scaled_attention,
+	const float* beta_gate,
 	const int numAttnHeads,
 	const int L
 ) {
@@ -172,10 +174,13 @@ __global__ void compute_scaled_attention_grad_sums_across_rows_and_cols(
 
 	// col > index for rows
 	float row_sum = 0.0f;
-	for (int rowCellIndex = attn_head_offset + headRelativeTokenIndex + (headRelativeTokenIndex + 1) * L; rowCellIndex < attn_head_offset + headRelativeTokenIndex + (L * L); rowCellIndex += L) {
+	int diagonal_row_index = attn_head_offset + headRelativeTokenIndex + (headRelativeTokenIndex) * L;
+	for (int rowCellIndex = diagonal_row_index + L; rowCellIndex < attn_head_offset + headRelativeTokenIndex + (L * L); rowCellIndex += L) {
 		row_sum += (scaled_attention[rowCellIndex] * upgrad_scaled_attention[rowCellIndex]);
 	}
 	rowGradSums[index] = row_sum;
+	float row_beta = beta_gate[index];
+	beta_grad[index] = row_beta > 1e-20f ? ((row_sum + scaled_attention[diagonal_row_index] * upgrad_scaled_attention[diagonal_row_index]) / row_beta) : 0.0f;
 
 	// row < index for cols
 	float col_sum = 0.0f;
@@ -199,11 +204,9 @@ __global__ void unwind_alpha_beta_gates(
 
 	float active_sum = 0.0f;
 	for (int globalTokenIndex = headOffset + 1; globalTokenIndex < headOffset + L; globalTokenIndex++) {
-		active_sum += (row_sum[globalTokenIndex - 1] - col_sum[globalTokenIndex - 1]);
-		alpha_grad[globalTokenIndex] = active_sum / alpha_gate[globalTokenIndex];
-		// need to clarify the zero case? even if alpha[k] is zero (1e-20), the result of moving it from zero is indepedent of its initial value
-		// would it be unstable / have no calculus nice derivative and hence we zero it out?
-		// not yet implemented
+		active_sum += (rowGradSums[globalTokenIndex - 1] - colGradSums[globalTokenIndex - 1]);
+		float current_alpha_val = alpha_gate[globalTokenIndex];
+		alpha_grad[globalTokenIndex] = current_alpha_val > 1e-20f ? (active_sum / current_alpha_val) : 0.0f;
 	}
 }
 
