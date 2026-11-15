@@ -100,6 +100,113 @@ __global__ void set_alpha_beta_gates(
     beta_gate[index] = 1.0f / (1.0f + expf(-beta[index]));
 }
 
+__global__ void compute_alpha_prefix_sum(
+	float* alpha_prefix_sum,
+	const float* alpha_gate,
+	const int L
+) {
+	int headIndex = blockIdx.x;
+	int gate_head_offset = headIndex * L;
+
+	alpha_prefix_sum[gate_head_offset] = 0.0f; // the unused alpha[0]
+	float running_sum = 0.0f;
+	for (int alpha_index = gate_head_offset + 1; alpha_index < (gate_head_offset + L); alpha_index++) {
+		running_sum += logf(fmaxf(alpha_gate[alpha_index], 1e-20f));
+		alpha_prefix_sum[alpha_index] = running_sum;
+	}
+}
+
+__global__ void scale_attention_by_head(
+	float* attention,
+	const float* alpha_prefix_sum,
+	const float* beta_gate,
+	const int numAttnHeads,
+	const int L
+) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	int headSize = L * L;
+	int maxSize = headSize * numAttnHeads;
+
+	if (index >= maxSize) {
+		return;
+	}
+
+	int headIndex = index / headSize;
+	int headRelativeIndex = index - headSize * headIndex;
+	int headRelativeColIndex = headRelativeIndex / L;
+	int headRelativeRowIndex = headRelativeIndex - headRelativeColIndex * L;
+
+	if (headRelativeRowIndex > headRelativeColIndex) {
+		attention[index] = 0.0f;
+		return;
+	}
+
+	int gate_head_offset = headIndex * L;
+	int gate_current_col_based_index = gate_head_offset + headRelativeColIndex;
+	int gate_current_row_based_index = gate_head_offset + headRelativeRowIndex;
+	
+	float attn_gate_scale = expf(alpha_prefix_sum[gate_current_col_based_index] - alpha_prefix_sum[gate_current_row_based_index]) * beta_gate[gate_current_row_based_index];
+	attention[index] *= attn_gate_scale;
+}
+
+__global__ void compute_scaled_attention_grad_sums_across_rows_and_cols(
+	float* colGradSums,
+	float* rowGradSums,
+	const float* upgrad_scaled_attention,
+	const float* scaled_attention,
+	const int numAttnHeads,
+	const int L
+) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	int maxSize = L * numAttnHeads;
+	if (index >= maxSize) {
+		return;
+	}
+
+	int headIndex = index / L;
+	int headRelativeTokenIndex = index - L * headIndex;
+
+	int attn_head_offset = headIndex * L * L;
+
+	// col > index for rows
+	float row_sum = 0.0f;
+	for (int rowCellIndex = attn_head_offset + headRelativeTokenIndex + (headRelativeTokenIndex + 1) * L; rowCellIndex < attn_head_offset + headRelativeTokenIndex + (L * L); rowCellIndex += L) {
+		row_sum += (scaled_attention[rowCellIndex] * upgrad_scaled_attention[rowCellIndex]);
+	}
+	rowGradSums[index] = row_sum;
+
+	// row < index for cols
+	float col_sum = 0.0f;
+	for (int colCellIndex = attn_head_offset + headRelativeTokenIndex * L; colCellIndex < attn_head_offset + headRelativeTokenIndex * L + headRelativeTokenIndex; colCellIndex += 1) {
+		col_sum += (scaled_attention[colCellIndex] * upgrad_scaled_attention[colCellIndex]);
+	}
+	colGradSums[index] = col_sum;	
+}
+
+__global__ void unwind_alpha_beta_gates(
+	float* alpha_grad,
+	const float* alpha_gate,
+	const float* colGradSums,
+	const float* rowGradSums,
+	const int L
+) {
+	int headIndex = blockIdx.x;
+	int headOffset = headIndex * L;
+
+	alpha_grad[headOffset] = 0.0f;
+
+	float active_sum = 0.0f;
+	for (int globalTokenIndex = headOffset + 1; globalTokenIndex < headOffset + L; globalTokenIndex++) {
+		active_sum += (row_sum[globalTokenIndex - 1] - col_sum[globalTokenIndex - 1]);
+		alpha_grad[globalTokenIndex] = active_sum / alpha_gate[globalTokenIndex];
+		// need to clarify the zero case? even if alpha[k] is zero (1e-20), the result of moving it from zero is indepedent of its initial value
+		// would it be unstable / have no calculus nice derivative and hence we zero it out?
+		// not yet implemented
+	}
+}
+
 /*
 S is not weights!
 St ~ v_1 * k_1_transpose + v_2 * k_2_transpose + ... v_t * k_t_transpose
@@ -146,6 +253,85 @@ With gates this becomes:
 
 alpha * St-1 + (-alpha * St-1 * k_t + v_t) * beta * k_t_transpose
 */
+
+S0 = beta[0] * V[0] * K[0]^t
+S1 = alpha[1] * S0 + beta[1] * V[1] * K[1]^t
+S2 = alpha[2] * S1 + beta[2] * V[2] * K[2]^t
+S3 = alpha[3] * S2 + beta[3] * V[3] * K[3]^t
+
+S0 * Q[0] -> [beta[0] * V[0] * K[0]^t] * Q[0]
+
+S1 * Q[1] -> [alpha[1] * (beta[0] * V[0] * K[0]^t) + (beta[1] * V[1] * K[1]^t)] * Q[1]
+
+S2 * Q[2] -> [alpha[2] * (alpha[1] * beta[0] * V[0] * K[0]^t + beta[1] * V[1] * K[1]^t) + (beta[2] * V[2] * K[2]^t)] * Q[2]
+
+scales all of V[0]: K[0]^t * Q[2]
+scales all of V[1]: K[1]^t * Q[2]
+scales all of V[2]: K[2]^t * Q[2]
+
+And they sum for the output col
+
+But from the perspective of alpha and beta:
+It would appear that each attention matrix value has a unique combo:
+
+alpha[2] * alpha[1] * beta[0] // col index 2, row 0
+alpha[2] * beta[1] // col index 2, row 1
+beta[2] // col index 2, row 2
+
+If I can store L alphas sequences, and then divide one by the other to get shorter
+alpha[L] * ... * alpha[1] / (alpha[L] * ... alpha[3])
+and then just multiply by beta.
+
+__global__ void compute_alpha_prefix_sum(
+	float* alpha_prefix_sum,
+	const float* alpha_gate,
+	const int L
+) {
+	int headIndex = blockIdx.x;
+	int gate_head_offset = headIndex * L;
+
+	alpha_prefix_sum[gate_head_offset] = 0.0f; // the unused alpha[0]
+	float running_sum = 0.0f;
+	for (int alpha_index = gate_head_offset + 1; alpha_index < (gate_head_offset + L); alpha_index++) {
+		running_sum += logf(fmaxf(alpha_gate[alpha_index], 1e-20f));
+		alpha_prefix_sum[alpha_index] = running_sum;
+	}
+}
+
+__global__ void scale_attention_by_head(
+	float* attention,
+	const float* alpha_prefix_sum,
+	const float* beta_gate,
+	const int numAttnHeads,
+	const int L
+) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	int headSize = L * L;
+	int maxSize = headSize * numAttnHeads;
+
+	if (index >= maxSize) {
+		return;
+	}
+
+	int headIndex = index / headSize;
+	int headRelativeIndex = index - headSize * headIndex;
+	int headRelativeColIndex = headRelativeIndex / L;
+	int headRelativeRowIndex = headRelativeIndex - headRelativeColIndex * L;
+
+	if (headRelativeRowIndex > headRelativeColIndex) {
+		attention[index] = 0.0f;
+		return;
+	}
+
+	int gate_head_offset = headIndex * L;
+	int gate_current_col_based_index = gate_head_offset + headRelativeColIndex;
+	int gate_current_row_based_index = gate_head_offset + headRelativeRowIndex;
+	
+	float attn_gate_scale = expf(alpha_prefix_sum[gate_current_col_based_index] - alpha_prefix_sum[gate_current_row_based_index]) * beta_gate[gate_current_row_based_index];
+	attention[index] *= attn_gate_scale;
+}
+
 
 __global__ void run_state_update_loop(
 	float* output,
@@ -203,6 +389,8 @@ __global__ void run_state_update_loop(
 	*/
 }
 
+// some of the names need to be clarified, things like dim_L to see what shape they traverse
+// complete write up required
 __global__ void unwind_state_update_loop(
 	float* output_grad,
 	float* state_grad,
