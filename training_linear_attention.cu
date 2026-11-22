@@ -182,13 +182,12 @@ __global__ void compute_x_pre_l2_grads(
 	x_pre_l2_grad[index] = l2_inverse_col_sums_by_col_by_head[colOffsetWithLColsByHead] * (x_post_l2_upgrad[index] - x_post_l2[index] * features_times_grad_sums_by_col_by_head[colOffsetWithLColsByHead]);
 }
 
-__global__ void compute_conv_grads(
+__global__ void compute_conv_weight_grads(
 	float* conv_weights_grad,
-	float* x_post_pre_silu_grad,
+	float* x_post_conv_pre_silu_grad,
 	const float* x_pre_l2_upgrad,
-	const float* x_post_conv_post_pre_silu,
+	const float* x_post_conv_pre_silu,
 	const float* x_pre_conv,
-	const float* conv_weights,
 	int L
 ) {
 	int channelIndex = blockIdx.x;
@@ -197,8 +196,7 @@ __global__ void compute_conv_grads(
 	int tIndex = threadIdx.x; // 128
 	int shared_data_thread_offset = (tIndex + 1) * 4 - 1; // 3, 7, 11, 15
 
-	// 128 * 4
-	extern __shared__ float sData[]; // if it's too big would need to move to outside shared mem
+	extern __shared__ float sData[]; // 128 * 4
 	sData[shared_data_thread_offset] = 0.0f;
 	sData[shared_data_thread_offset - 1] = 0.0f;
 	sData[shared_data_thread_offset - 2] = 0.0f;
@@ -207,32 +205,26 @@ __global__ void compute_conv_grads(
 	for (int tokenIndex = tIndex; tokenIndex < L; tokenIndex += threadsPerBlock) {
 		int post_conv_index = channelIndex + tokenIndex * dim;
 		
-		float token_post_conv_post_pre_silu = x_post_conv_post_pre_silu[post_conv_index];
-		float sig = 1.0f / (1.0f + expf(-token_post_conv_post_pre_silu));
-		float token_post_conv_pre_silu_upgrad = sig * (1.0f + token_post_conv_post_pre_silu * (1.0f - sig));
+		float token_post_conv_pre_silu = x_post_conv_pre_silu[post_conv_index];
+		float sig = 1.0f / (1.0f + expf(-token_post_conv_pre_silu));
+		float token_post_conv_pre_silu_upgrad = sig * (1.0f + token_post_conv_pre_silu * (1.0f - sig));
 
 		float token_x_pre_l2_upgrad = x_pre_l2_upgrad[post_conv_index];
 
 		float total_upgrad = token_post_conv_pre_silu_upgrad * token_x_pre_l2_upgrad;
-		x_post_pre_silu_grad[post_conv_index] = total_upgrad;
+		x_post_conv_pre_silu_grad[post_conv_index] = total_upgrad;
 
 		int x3_index = post_conv_index;
 		sData[shared_data_thread_offset] += (x_pre_conv[x3_index] * total_upgrad);
 
-		if (tokenIndex >= 1) {
-			int x2_index = x3_index - dim;
-			sData[shared_data_thread_offset - 1] += x_pre_conv[x2_index] * total_upgrad;
+		int x2_index = x3_index - dim;
+		sData[shared_data_thread_offset - 1] += (tokenIndex >= 1 ? x_pre_conv[x2_index] * total_upgrad : 0.0f);
 
-			if (tokenIndex >= 2) {
-				int x1_index = x2_index - dim;	
-				sData[shared_data_thread_offset - 2] += (x_pre_conv[x1_index] * token_post_conv_pre_silu_upgrad * x_pre_l2_upgrad);
+		int x1_index = x2_index - dim;	
+		sData[shared_data_thread_offset - 2] += (tokenIndex >= 2 ? (x_pre_conv[x1_index] * total_upgrad) : 0.0f);
 
-				if (tokenIndex >= 3) {
-					int x0_index = x1_index - dim;
-					sData[shared_data_thread_offset - 3] += (x_pre_conv[x0_index] * token_post_conv_pre_silu_upgrad * x_pre_l2_upgrad);
-				}
-			}	
-		}
+		int x0_index = x1_index - dim;
+		sData[shared_data_thread_offset - 3] += (tokenIndex >= 3 ? (x_pre_conv[x0_index] * total_upgrad) : 0.0f);
 	}
 
 	__syncthreads();
@@ -257,6 +249,36 @@ __global__ void compute_conv_grads(
 		conv_weights_grad[conv_weight_channel_offset - 2] += sData[1];
 		conv_weights_grad[conv_weight_channel_offset - 3] += sData[0];		
 	}
+}
+
+__global__ void compute_x_pre_conv_grads(
+	float* x_pre_conv_pre_silu_grad,
+	const float* x_post_conv_pre_silu_upgrad,
+	const float* conv_weights,
+	const int L
+) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int maxCount = dim * L;
+	if (index >= maxCount) {
+		return;
+	}
+
+	int tokenIndex = index / dim;
+	int channelIndex = index - tokenIndex * dim;
+
+	int conv_weight_channel_offset = (channelIndex + 1) * 4 - 1;
+
+	// w3 * token 0 --> token 0 upgrad
+	// w2 * token 0 --> token 1 upgrad
+	// w1 * token 0 --> token 2 upgrad
+	// w0 * token 0 --> token 3 upgrad
+
+	float current_x_pre_conv_pre_silu_grad = conv_weights[conv_weight_channel_offset] * x_post_conv_pre_silu_upgrad[index];
+	current_x_pre_conv_pre_silu_grad += (tokenIndex < L - 1 ? (conv_weights[conv_weight_channel_offset - 1] * x_post_conv_pre_silu_upgrad[index + dim]) : 0.0f);
+	current_x_pre_conv_pre_silu_grad += (tokenIndex < L - 2 ? (conv_weights[conv_weight_channel_offset - 2] * x_post_conv_pre_silu_upgrad[index + 2 * dim]) : 0.0f);
+	current_x_pre_conv_pre_silu_grad += (tokenIndex < L - 3 ? (conv_weights[conv_weight_channel_offset - 3] * x_post_conv_pre_silu_upgrad[index + 3 * dim]) : 0.0f);
+
+	x_pre_conv_pre_silu_grad[index] = current_x_pre_conv_pre_silu_grad;
 }
 
 void run_linear_attn_gate_unwinding_for_training(int tIndex, int linearAttnIndex, int L) {
