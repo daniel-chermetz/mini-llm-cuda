@@ -358,7 +358,7 @@ void run_linear_attn_gate_unwinding_for_training(int tIndex, int linearAttnIndex
 		laBackpropCalculations.alpha_activation,
 		CUDA_R_32F,
 		L, // ldb, mem col size for col-major
-		&beta_one, // 1 to accumulate with the existing x_postRMS1_post_gamma
+		&beta,
 		tBackpropCalculations.x_postRMS1_post_gamma, // must be initialized to zero at the beginning of every sequence!
 		CUDA_R_32F,
 		dim, // ldc, mem col size
@@ -511,13 +511,13 @@ void run_linear_attn_V_K_Q_unwinding_for_training(int tIndex, int linearAttnInde
 	);	
 
 	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
-		tBackpropCalculations.keys,
+		tBackpropCalculations.keysPreRoPE,
 		laBackpropCalculations.keys_post_conv_pre_silu,
 		laWeights.conv_key_weights,
 		L
 	);
 	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
-		tBackpropCalculations.queries,
+		tBackpropCalculations.queriesPreRoPE,
 		laBackpropCalculations.queries_post_conv_pre_silu,
 		laWeights.conv_query_weights,
 		L

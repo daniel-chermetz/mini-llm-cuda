@@ -454,6 +454,14 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
        		}
         }
 
+        int linearAttnIndex = CONFIG_LINEAR_ATTN_by_tIndex[tIndex];
+        laCalcs;
+        laBackpropCalculations;
+        if (linearAttnIndex != -1) {
+            laCalcs = linearAttnCalculations_DEVICE[linearAttnIndex];
+            laBackpropCalculations = linearAttnBackpropCalculations[linearAttnIndex];
+        }   
+
 		// (dLoss/d_ffn_final) * (d_ffn_final/d_ffn_right_postHadamard)
 		// transformerWeights_DEVICE[tIndex].ffn_left_weights: [dim, ffnDim],
 		// transformerCalculations_DEVICE[tIndex].ffn_right_postHadamard: [ffnDim, L],
@@ -749,12 +757,12 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        CUDA_R_32F,
 	        dim, // lda, mem col size
 	        headDim, // mem stride to reach next head
-	        transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax,
+	        (linearAttnIndex == -1 ? transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax : laCalcs.scaled_attnKtQByHead),
 	        CUDA_R_32F,
 	        L, // ldb, col size in mem for col-major
 	        (L * L), // mem stride to reach next head
 	        &beta,
-	        backpropCalculations[tIndex].values,
+	        (linearAttnIndex == -1 ? backpropCalculations[tIndex].values : laBackpropCalculations.values_post_conv_post_silu),
 	        CUDA_R_32F,
 	        dim, // ldc, col size in mem
 	        headDim, // mem stride to reach next head
@@ -774,7 +782,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        L, // cols C
 	        headDim, // contracting (shared) dim
 	        &alpha,
-	        transformerCalculations_DEVICE[tIndex].values,
+	        (linearAttnIndex == -1 ? transformerCalculations_DEVICE[tIndex].values : laCalcs.values_post_conv_post_silu),
 	        CUDA_R_32F,
 	        dim, // lda, mem col size
 	        headDim, // mem stride to reach next head
@@ -783,7 +791,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        dim, // ldb, col size in mem for col-major
 	        headDim, // mem stride to reach next head
 	        &beta,
-	        backpropCalculations[tIndex].attnByHead_postSoftmax,
+	        (linearAttnIndex == -1 ? backpropCalculations[tIndex].attnByHead_postSoftmax : laBackpropCalculations.scaled_attnKtQByHead),
 	        CUDA_R_32F,
 	        L, // ldc, col size in mem
 	        L * L, // mem stride to reach next head
@@ -792,23 +800,32 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        CUBLAS_GEMM_DEFAULT
 	    );
 
-		xTotalThreads = attnHeads * L;
-	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	    preCalcSoftmaxGradSumByCol<<<numBlocks, threadsPerBlock>>>(
-	    	backpropCalculations[tIndex].attnSoftmaxGradSumByCol, 
-	    	transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, 
-	    	backpropCalculations[tIndex].attnByHead_postSoftmax, 
-	    	attnHeads, L
-	    );
+	    if (linearAttnIndex == -1) {
+			xTotalThreads = attnHeads * L;
+		    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		    preCalcSoftmaxGradSumByCol<<<numBlocks, threadsPerBlock>>>(
+		    	backpropCalculations[tIndex].attnSoftmaxGradSumByCol, 
+		    	transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, 
+		    	backpropCalculations[tIndex].attnByHead_postSoftmax, 
+		    	attnHeads, L
+		    );
+			xTotalThreads = attnHeads * L * L;
+		    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+			dLoss_d_pre_softmax_pre_div_by_sqrt_head_dim<<<numBlocks, threadsPerBlock>>>(
+				backpropCalculations[tIndex].attnKtQByHead, 
+				transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, 
+				backpropCalculations[tIndex].attnSoftmaxGradSumByCol, 
+				backpropCalculations[tIndex].attnByHead_postSoftmax, 
+				attnHeads, headDim, L
+			);
+		} else {
+			// IMPORTANT: right side (attnKtQByHead) by head used to have gradient zeroed for masked features (the features are masked but the gradient looks to unmasked V),
+			// hence we need to repeat part of what the softmax kernel used to do in zeroing up the masked upstream gradients
+			run_linear_attn_gate_unwinding_for_training(tIndex, linearAttnIndex, L);			
+		}
+
 		xTotalThreads = attnHeads * L * L;
-	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-		dLoss_d_pre_softmax_pre_div_by_sqrt_head_dim<<<numBlocks, threadsPerBlock>>>(
-			backpropCalculations[tIndex].attnKtQByHead, 
-			transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, 
-			backpropCalculations[tIndex].attnSoftmaxGradSumByCol, 
-			backpropCalculations[tIndex].attnByHead_postSoftmax, 
-			attnHeads, headDim, L
-		);
+		numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 
 		// dL/d(K.t) [L, headDim] = G [L, L] @ Q.t [L, headDim]
 		// dL/dK [headDim, L] = Q [headDim, L] * G.t [L, L]
@@ -821,7 +838,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        L, // cols C
 	        L, // contracting (shared) dim
 	        &alpha,
-	        transformerCalculations_DEVICE[tIndex].queriesPostRoPE,
+	        (linearAttnIndex == -1 ? transformerCalculations_DEVICE[tIndex].queriesPostRoPE : laCalcs.queries_post_l2_norm),
 	        CUDA_R_32F,
 	        dim, // lda, mem col size
 	        headDim, // mem stride to reach next head
@@ -830,7 +847,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        L, // ldb, col size in mem for col-major
 	        (L * L), // mem stride to reach next head
 	        &beta,
-	        backpropCalculations[tIndex].keysPostRoPE,
+	        (linearAttnIndex == -1 ? backpropCalculations[tIndex].keysPostRoPE : laBackpropCalculations.keys_post_l2_norm),
 	        CUDA_R_32F,
 	        dim, // ldc, col size in mem
 	        headDim, // mem stride to reach next head
@@ -849,7 +866,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        L, // cols C
 	        L, // contracting (shared) dim
 	        &alpha,
-	        transformerCalculations_DEVICE[tIndex].keysPostRoPE,
+	        (linearAttnIndex == -1 ? transformerCalculations_DEVICE[tIndex].keysPostRoPE : laCalcs.keys_post_l2_norm),
 	        CUDA_R_32F,
 	        dim, // lda, mem col size
 	        headDim, // mem stride to reach next head
@@ -858,7 +875,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        L, // ldb, col size in mem for col-major
 	        (L * L), // mem stride to reach next head
 	        &beta,
-	        backpropCalculations[tIndex].queriesPostRoPE,
+	      	(linearAttnIndex == -1 ? backpropCalculations[tIndex].queriesPostRoPE : laBackpropCalculations.queries_post_l2_norm),
 	        CUDA_R_32F,
 	        dim, // ldc, col size in mem
 	        headDim, // mem stride to reach next head
@@ -867,24 +884,26 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        CUBLAS_GEMM_DEFAULT
 	    );
 
-		xTotalThreads = dimPairs * L;
-	    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-	    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
-	    	backpropCalculations[tIndex].keysPreRoPE, 
-	    	ropeThetaStore_DEVICE, 
-	    	backpropCalculations[tIndex].keysPostRoPE, 
-	    	dimPairs, 
-	    	L
-	    );
-	    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
-	    	backpropCalculations[tIndex].queriesPreRoPE, 
-	    	ropeThetaStore_DEVICE, 
-	    	backpropCalculations[tIndex].queriesPostRoPE, 
-	    	dimPairs, 
-	    	L
-	    );
+	    if (linearAttnIndex == -1) {
+			xTotalThreads = dimPairs * L;
+		    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+		    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
+		    	backpropCalculations[tIndex].keysPreRoPE, 
+		    	ropeThetaStore_DEVICE, 
+		    	backpropCalculations[tIndex].keysPostRoPE, 
+		    	dimPairs, 
+		    	L
+		    );
+		    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
+		    	backpropCalculations[tIndex].queriesPreRoPE, 
+		    	ropeThetaStore_DEVICE, 
+		    	backpropCalculations[tIndex].queriesPostRoPE, 
+		    	dimPairs, 
+		    	L
+		    );
+		}
 
-	    if (CONFIG_QK_RMS_NORM) {
+	    if (CONFIG_QK_RMS_NORM && linearAttnIndex == -1) {
             dim3 qkRMSGridDim(L, attnHeads);
 
 			preCalcRMSColWideVals_acrossHeads<<<qkRMSGridDim, 1>>>(
@@ -949,6 +968,10 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	    	);
 	    }
 
+	    if (linearAttnIndex != -1) {
+	   		run_linear_attn_V_K_Q_unwinding_for_training(tIndex, linearAttnIndex, L);
+	    }
+
 		// dL/dA [dim, dim] = G [dim, L] @ B.t [L, dim]
 		// (dLoss / d_values) / (d_values / d_value_weights)
 		cublasGemmEx(
@@ -982,7 +1005,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    dim, // cols C
 		    L, // contracting (shared) dim
 		    &alpha,
-		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].keysPreRoPE_preRMS : backpropCalculations[tIndex].keysPreRoPE),
+		    ((CONFIG_QK_RMS_NORM && linearAttnIndex == -1) ? backpropCalculations[tIndex].keysPreRoPE_preRMS : backpropCalculations[tIndex].keysPreRoPE),
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
 		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
@@ -1005,7 +1028,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    dim, // cols C
 		    L, // contracting (shared) dim
 		    &alpha,
-		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].queriesPreRoPE_preRMS : backpropCalculations[tIndex].queriesPreRoPE),
+		    ((CONFIG_QK_RMS_NORM && linearAttnIndex == -1) ? backpropCalculations[tIndex].queriesPreRoPE_preRMS : backpropCalculations[tIndex].queriesPreRoPE),
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
 		    transformerCalculations_DEVICE[tIndex].x_postRMS1_post_gamma,
@@ -1060,7 +1083,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    backpropCalculations[tIndex].values,
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
-		    &beta,
+		    (linearAttnIndex == -1 ? &beta : &beta_one),
 		    backpropCalculations[tIndex].x_postRMS1_post_gamma,
 		    CUDA_R_32F,
 		    dim, // ldc, mem col size
@@ -1080,7 +1103,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    transformerWeights_DEVICE[tIndex].key_weights,
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
-		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].keysPreRoPE_preRMS : backpropCalculations[tIndex].keysPreRoPE),
+		    ((CONFIG_QK_RMS_NORM && linearAttnIndex == -1) ? backpropCalculations[tIndex].keysPreRoPE_preRMS : backpropCalculations[tIndex].keysPreRoPE),
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
 		    &beta_one,
@@ -1103,7 +1126,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		    transformerWeights_DEVICE[tIndex].query_weights,
 		    CUDA_R_32F,
 		    dim, // lda, mem col size for col-major
-		    (CONFIG_QK_RMS_NORM ? backpropCalculations[tIndex].queriesPreRoPE_preRMS : backpropCalculations[tIndex].queriesPreRoPE),
+		    ((CONFIG_QK_RMS_NORM && linearAttnIndex == -1) ? backpropCalculations[tIndex].queriesPreRoPE_preRMS : backpropCalculations[tIndex].queriesPreRoPE),
 		    CUDA_R_32F,
 		    dim, // ldb, mem col size for col-major
 		    &beta_one,
