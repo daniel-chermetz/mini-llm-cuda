@@ -388,6 +388,12 @@ int runInference(int L) {
         int pleIndex = CONFIG_PLE_post_transformer_by_tIndex[tIndex + 1];
         bool consume_last_ple_result = (CONFIG_PLE && pleIndex != -1);
 
+        int linearAttnIndex = CONFIG_LINEAR_ATTN_by_tIndex[tIndex];
+        laCalcs;
+        if (linearAttnIndex != -1) {
+            laCalcs = linearAttnCalculations_DEVICE[linearAttnIndex];
+        }
+
         if (tIndex == transformers - 1) {
             getRMSColSums<<<L, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].x_sumByCol_RMS1, x_DEVICE, dim);
         } else {
@@ -468,7 +474,7 @@ int runInference(int L) {
             CUBLAS_GEMM_DEFAULT             
         );
 
-        if (CONFIG_QK_RMS_NORM) {
+        if (CONFIG_QK_RMS_NORM && linearAttnIndex == -1) {
             dim3 qkRMSGridDim(L, attnHeads);
             getRMSColSumsAcrossHeads<<<qkRMSGridDim, 64, sharedMemSize_head>>>(transformerCalculations_DEVICE[tIndex].queries_RMS_sumByColByHead, transformerCalculations_DEVICE[tIndex].queries);
             getRMSColSumsAcrossHeads<<<qkRMSGridDim, 64, sharedMemSize_head>>>(transformerCalculations_DEVICE[tIndex].keys_RMS_sumByColByHead, transformerCalculations_DEVICE[tIndex].keys);
@@ -479,12 +485,14 @@ int runInference(int L) {
 
         xTotalThreads = dimPairs * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        if (CONFIG_QK_RMS_NORM) {
-            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma, preComputedRopeTheta_DEVICE, headDim, dim, L);
-            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma, preComputedRopeTheta_DEVICE, headDim, dim, L);
-        } else {
-            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
-            applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
+        if (CONFIG_ROPE && linearAttnIndex == -1) {
+            if (CONFIG_QK_RMS_NORM) {
+                applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma, preComputedRopeTheta_DEVICE, headDim, dim, L);
+                applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma, preComputedRopeTheta_DEVICE, headDim, dim, L);
+            } else {
+                applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].queriesPostRoPE, transformerCalculations_DEVICE[tIndex].queries, preComputedRopeTheta_DEVICE, headDim, dim, L);
+                applyRoPE<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].keysPostRoPE, transformerCalculations_DEVICE[tIndex].keys, preComputedRopeTheta_DEVICE, headDim, dim, L);
+            }
         }
 
         if (CONFIG_QUERY_GATING) {
@@ -511,6 +519,27 @@ int runInference(int L) {
             );
         }
 
+        if (linearAttnIndex != -1) {
+            runLinearAttnPreparationInference(tIndex, linearAttnIndex, L);
+        }
+
+        // keys and queries to use
+        float* attnKeys;
+        float* attnQueries;
+        if (linearAttnIndex != -1) {
+            attnKeys = laCalcs.keys_post_l2_norm;
+            attnQueries = laCalcs.queries_post_l2_norm;
+        } else if (CONFIG_ROPE) {
+            attnKeys = transformerCalculations_DEVICE[tIndex].keysPostRoPE;
+            attnQueries = transformerCalculations_DEVICE[tIndex].queriesPostRoPE;
+        } else if (CONFIG_QK_RMS_NORM) {
+            attnKeys = transformerCalculations_DEVICE[tIndex].keys_postRMS_post_gamma;
+            attnQueries = transformerCalculations_DEVICE[tIndex].queries_postRMS_post_gamma;
+        } else {
+            attnKeys = transformerCalculations_DEVICE[tIndex].keys;
+            attnQueries = transformerCalculations_DEVICE[tIndex].queries;            
+        }
+
         // K.t @ Q
         cublasGemmStridedBatchedEx(
             handle,
@@ -520,11 +549,11 @@ int runInference(int L) {
             L, // n (K.t@Q one attn head cols)
             headDim, // k
             &alpha,
-            transformerCalculations_DEVICE[tIndex].keysPostRoPE,
+            attnKeys,
             CUDA_R_32F,
             dim, // lda, col size in mem (but with CUBLAS_OP_T is logical row)
             headDim, // mem stride in K.t to reach next head (with CUBLAS_OP_T moves along a logical row)
-            transformerCalculations_DEVICE[tIndex].queriesPostRoPE,
+            attnQueries,
             CUDA_R_32F,
             dim, // ldb, col size in mem for col-major
             headDim, // mem stride in Q to reach next head
@@ -537,17 +566,24 @@ int runInference(int L) {
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
         );   
-        
+
+        if (linearAttnIndex == -1) {        
+            xTotalThreads = attnHeads * L * L;
+            numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+            getHeadDimScaledMaskedAttn<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnKtQByHead, attnHeads, headDim, L);
+
+            dim3 attnSoftmaxGridDim(attnHeads, L);
+            getAttnHeadsMaxByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, attnHeads, L);
+            getAttnHeadsSumByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
+            xTotalThreads = attnHeads * L * L;
+            numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;   
+            applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, attnHeads, L);
+        } else {
+            runLinearAttnGateScalingInference(tIndex, linearAttnIndex, L);
+        }
+
         xTotalThreads = attnHeads * L * L;
         numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
-        getHeadDimScaledMaskedAttn<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnKtQByHead, attnHeads, headDim, L);
-
-        dim3 attnSoftmaxGridDim(attnHeads, L);
-        getAttnHeadsMaxByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, attnHeads, L);
-        getAttnHeadsSumByCol_softmax<<<attnSoftmaxGridDim, 256, sharedMemSize>>>(transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnKtQByHeadScaledMasked, transformerCalculations_DEVICE[tIndex].attnByHead_maxByCol_softmax, attnHeads, L);
-        xTotalThreads = attnHeads * L * L;
-        numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;    
-        applySoftmaxToAttnHeads<<<numBlocks, threadsPerBlock>>>(transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax, transformerCalculations_DEVICE[tIndex].attnByHead_expfCache_softmax, transformerCalculations_DEVICE[tIndex].attnByHead_sumByCol_softmax, attnHeads, L);
 
         // V @ attnByHead_postSoftmax
         cublasGemmStridedBatchedEx(
@@ -558,16 +594,16 @@ int runInference(int L) {
             L, // n (C cols)
             L, // k (shared dim)
             &alpha,
-            transformerCalculations_DEVICE[tIndex].values,
+            (linearAttnIndex == -1 ? transformerCalculations_DEVICE[tIndex].values : laCalcs.values_post_conv_post_silu),
             CUDA_R_32F,
             dim, // lda, col size in mem for col-major
             headDim, // mem stride in values to reach next head
-            transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax,
+            (linearAttnIndex == -1 ? transformerCalculations_DEVICE[tIndex].attnByHead_postSoftmax : laCalcs.scaled_attnKtQByHead),
             CUDA_R_32F,
             L, // ldb, col size in mem for col-major
             (L * L), // mem stride in softmaxAttn to reach next head
             &beta,
-            transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn,
+            transformerCalculations_DEVICE[tIndex].valueScaledSoftmaxAttn, // it's no longer softmax in a linear layer
             CUDA_R_32F,
             dim, // ldc, fused attn heads col size in mem; would have headDim if mult. by head
             headDim, // mem stride in valueScaledSoftmaxAttn with fused attn heads to reach next head; would have been (headDim * L) if mult.
