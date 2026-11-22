@@ -89,7 +89,7 @@ __global__ void set_alpha_beta_gates(
 	const float* alpha, // [L, attnHeads]
 	const float* beta, // [L, attnHeads]
 	const float* alpha_to_gate_by_head_weights, // [attnHeads]
-	const float* alpha_to_gate_bias_by_head_weights // [attnHeads]
+	const float* alpha_to_gate_bias_by_head_weights, // [attnHeads]
 	const int L
 ) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -195,11 +195,13 @@ void runLinearAttnPreparationInference(int tIndex, int linearAttnIndex, int L) {
 
 	apply_l2_norm<<<num_cols_scaled_by_attn_heads, 64, 64 * sizeof(float)>>>(
 		laCalcs.keys_post_l2_norm, 
+		laCalcs.keys_l2_inverse_col_sums_by_col_by_head,
 		laCalcs.keys_post_conv_post_silu,
 		L
 	);
 	apply_l2_norm<<<num_cols_scaled_by_attn_heads, 64, 64 * sizeof(float)>>>(
-		laCalcs.queries_post_l2_norm, 
+		laCalcs.queries_post_l2_norm,
+		laCalcs.queries_l2_inverse_col_sums_by_col_by_head,		
 		laCalcs.queries_post_conv_post_silu,
 		L
 	);

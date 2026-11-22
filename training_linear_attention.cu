@@ -193,10 +193,10 @@ __global__ void compute_conv_weight_grads(
 	int channelIndex = blockIdx.x;
 	int conv_weight_channel_offset = (channelIndex + 1) * 4 - 1;
 	int threadsPerBlock = blockDim.x;
-	int tIndex = threadIdx.x; // 128
+	int tIndex = threadIdx.x; // 128 or 256
 	int shared_data_thread_offset = (tIndex + 1) * 4 - 1; // 3, 7, 11, 15
 
-	extern __shared__ float sData[]; // 128 * 4
+	extern __shared__ float sData[]; // 128 * 4 or 256 * 4
 	sData[shared_data_thread_offset] = 0.0f;
 	sData[shared_data_thread_offset - 1] = 0.0f;
 	sData[shared_data_thread_offset - 2] = 0.0f;
@@ -308,7 +308,7 @@ void run_linear_attn_gate_unwinding_for_training(int tIndex, int linearAttnIndex
 	);
 
 	unwind_alpha_beta_gates<<<attnHeads, 1>>>(
-		laBackpropCalculations.alpha_beta,
+		laBackpropCalculations.alpha_gate,
 		laCalcs.alpha_gate,
 		laBackpropCalculations.colGradSums,
 		laBackpropCalculations.rowGradSums,
@@ -441,5 +441,91 @@ void run_linear_attn_gate_unwinding_for_training(int tIndex, int linearAttnIndex
 }
 
 void run_linear_attn_V_K_Q_unwinding_for_training(int tIndex, int linearAttnIndex, int L) {
-	// no implemented yet - that's the L2 and conv backpropagation
+	int blockSize = 256;
+	int dim_L_numBlocks = (dim * L + blockSize - 1) / blockSize;
+	int attnHeads_L_numBlocks = (attnHeads * L + blockSize - 1) / blockSize;
+
+	tCalcs = transformerCalculations_DEVICE[tIndex];
+	laCalcs = linearAttnCalculations_DEVICE[linearAttnIndex];
+
+	laWeights = linearAttnWeights_DEVICE[linearAttnIndex];
+
+	tBackpropCalculations = backpropCalculations[tIndex];
+	laBackpropCalculations = linearAttnBackpropCalculations[linearAttnIndex];
+
+	int num_cols_scaled_by_attn_heads = L * attnHeads;
+
+	get_L2_col_features_x_grad_sums_across_cols<<<num_cols_scaled_by_attn_heads, 64, 64 * sizeof(float)>>>(
+		laBackpropCalculations.keys_features_times_grad_sums_by_col_by_head,
+		laBackpropCalculations.keys_post_l2_norm,
+		laCalcs.keys_post_l2_norm,
+		L
+	);
+	get_L2_col_features_x_grad_sums_across_cols<<<num_cols_scaled_by_attn_heads, 64, 64 * sizeof(float)>>>(
+		laBackpropCalculations.queries_features_times_grad_sums_by_col_by_head,
+		laBackpropCalculations.queries_post_l2_norm,
+		laCalcs.queries_post_l2_norm,
+		L
+	);	
+
+	compute_x_pre_l2_grads<<<dim_L_numBlocks, blockSize>>>(
+		laBackpropCalculations.keys_post_conv_post_silu,
+		laBackpropCalculations.keys_post_l2_norm,
+		laCalcs.keys_post_l2_norm,	
+		laCalcs.keys_l2_inverse_col_sums_by_col_by_head,
+		laBackpropCalculations.keys_features_times_grad_sums_by_col_by_head,
+		L
+	);
+	compute_x_pre_l2_grads<<<dim_L_numBlocks, blockSize>>>(
+		laBackpropCalculations.queries_post_conv_post_silu,
+		laBackpropCalculations.queries_post_l2_norm,
+		laCalcs.queries_post_l2_norm,	
+		laCalcs.queries_l2_inverse_col_sums_by_col_by_head,
+		laBackpropCalculations.queries_features_times_grad_sums_by_col_by_head,
+		L
+	);
+
+	compute_conv_weight_grads<<<dim, 256, 1024 * sizeof(float)>>>(
+		laBackpropCalculations.conv_key_weights,
+		laBackpropCalculations.keys_post_conv_pre_silu,
+		laBackpropCalculations.keys_post_conv_post_silu,
+		laCalcs.keys_post_conv, // post_conv_pre_silu
+		tCalcs.keys,
+		L
+	);
+	compute_conv_weight_grads<<<dim, 256, 1024 * sizeof(float)>>>(
+		laBackpropCalculations.conv_query_weights,
+		laBackpropCalculations.queries_post_conv_pre_silu,
+		laBackpropCalculations.queries_post_conv_post_silu,
+		laCalcs.queries_post_conv, // post_conv_pre_silu
+		tCalcs.queries,
+		L
+	);
+	compute_conv_weight_grads<<<dim, 256, 1024 * sizeof(float)>>>(
+		laBackpropCalculations.conv_value_weights,
+		laBackpropCalculations.values_post_conv_pre_silu,
+		laBackpropCalculations.values_post_conv_post_silu,
+		laCalcs.values_post_conv, // post_conv_pre_silu
+		tCalcs.values,
+		L
+	);	
+
+	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
+		tBackpropCalculations.keys,
+		laBackpropCalculations.keys_post_conv_pre_silu,
+		laWeights.conv_key_weights,
+		L
+	);
+	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
+		tBackpropCalculations.queries,
+		laBackpropCalculations.queries_post_conv_pre_silu,
+		laWeights.conv_query_weights,
+		L
+	);
+	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
+		tBackpropCalculations.values,
+		laBackpropCalculations.values_post_conv_pre_silu,
+		laWeights.conv_value_weights,
+		L
+	);
 }
