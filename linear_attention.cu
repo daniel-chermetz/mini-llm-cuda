@@ -43,6 +43,7 @@ __global__ void apply_1D_conv(
 
 __global__ void apply_l2_norm(
 	float* x_post_l2_norm, 
+	float* l2_inverse_col_sums_by_col_by_head,
 	const float* x,
 	const int L
 ) {
@@ -70,23 +71,26 @@ __global__ void apply_l2_norm(
     }
 
     if (tIndex == 0) {
-    	sData[0] = sqrtf(sData[0] + 1e-6f);
+    	sData[0] = rsqrtf(sData[0] + 1e-6f);
+    	l2_inverse_col_sums_by_col_by_head[globalColIndex] = sData[0];
     }
     __syncthreads();
 
  	for (int rowIndex = tIndex; rowIndex < headDim; rowIndex += blockDim.x) {
  		int index = colOffset + rowIndex;
- 		x_post_l2_norm[index] = x[index] / sData[0];
+ 		x_post_l2_norm[index] = x[index] * sData[0];
  	}
 }
 
 __global__ void set_alpha_beta_gates(
 	float* alpha_gate,
+	float* alpha_softplus,
 	float* beta_gate,
 	const float* alpha, // [L, attnHeads]
 	const float* beta, // [L, attnHeads]
 	const float* alpha_to_gate_by_head_weights, // [attnHeads]
 	const float* alpha_to_gate_bias_by_head_weights // [attnHeads]
+	const int L
 ) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	if (index >= attnHeads * L) {
@@ -97,13 +101,65 @@ __global__ void set_alpha_beta_gates(
 
     float x = alpha[index] + alpha_to_gate_bias_by_head_weights[headIndex];
     float softplus_x = x > 20.0f ? x : log1pf(expf(x)); // ln(1 + e^(alpha + bias))
+    alpha_softplus[index] = softplus_x;
     alpha_gate[index] = expf(-expf(alpha_to_gate_by_head_weights[headIndex]) * softplus_x);
 
     beta_gate[index] = 1.0f / (1.0f + expf(-beta[index]));
 }
 
+__global__ void compute_alpha_prefix_sum(
+	float* alpha_prefix_sum,
+	const float* alpha_gate,
+	const int L
+) {
+	int headIndex = blockIdx.x;
+	int gate_head_offset = headIndex * L;
 
-void runLinearAttnInference(int tIndex, int linearAttnIndex, int L) {
+	alpha_prefix_sum[gate_head_offset] = 0.0f; // the unused alpha[0]
+	float running_sum = 0.0f;
+	for (int alpha_index = gate_head_offset + 1; alpha_index < (gate_head_offset + L); alpha_index++) {
+		running_sum += logf(fmaxf(alpha_gate[alpha_index], 1e-20f));
+		alpha_prefix_sum[alpha_index] = running_sum;
+	}
+}
+
+__global__ void scale_attention_by_head(
+	float* scaled_attention,
+	float* attn_alpha_beta_gate_scale,
+	const float* attention,
+	const float* alpha_prefix_sum,
+	const float* beta_gate,
+	const int L
+) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	int headSize = L * L;
+	int maxSize = headSize * attnHeads;
+
+	if (index >= maxSize) {
+		return;
+	}
+
+	int headIndex = index / headSize;
+	int headRelativeIndex = index - headSize * headIndex;
+	int headRelativeColIndex = headRelativeIndex / L;
+	int headRelativeRowIndex = headRelativeIndex - headRelativeColIndex * L;
+
+	if (headRelativeRowIndex > headRelativeColIndex) {
+		scaled_attention[index] = 0.0f;
+		return;
+	}
+
+	int gate_head_offset = headIndex * L;
+	int gate_current_col_based_index = gate_head_offset + headRelativeColIndex;
+	int gate_current_row_based_index = gate_head_offset + headRelativeRowIndex;
+	
+	float curr_attn_gate_scale = expf(alpha_prefix_sum[gate_current_col_based_index] - alpha_prefix_sum[gate_current_row_based_index]) * beta_gate[gate_current_row_based_index];
+	attn_alpha_beta_gate_scale[index] = curr_attn_gate_scale;
+	scaled_attention[index] = attention[index] * curr_attn_gate_scale;
+}
+
+void runLinearAttnPreparationInference(int tIndex, int linearAttnIndex, int L) {
 	int blockSize = 256;
 	int dim_L_numBlocks = (dim * L + blockSize - 1) / blockSize;
 	int attnHeads_L_numBlocks = (attnHeads * L + blockSize - 1) / blockSize;	
@@ -137,12 +193,12 @@ void runLinearAttnInference(int tIndex, int linearAttnIndex, int L) {
 
 	int num_cols_scaled_by_attn_heads = L * attnHeads;
 
-	apply_l2_norm<<<num_cols_scaled_by_attn_heads, headDim, headDim * sizeof(float)>>>(
+	apply_l2_norm<<<num_cols_scaled_by_attn_heads, 64, 64 * sizeof(float)>>>(
 		laCalcs.keys_post_l2_norm, 
 		laCalcs.keys_post_conv_post_silu,
 		L
 	);
-	apply_l2_norm<<<num_cols_scaled_by_attn_heads, headDim, headDim * sizeof(float)>>>(
+	apply_l2_norm<<<num_cols_scaled_by_attn_heads, 64, 64 * sizeof(float)>>>(
 		laCalcs.queries_post_l2_norm, 
 		laCalcs.queries_post_conv_post_silu,
 		L
@@ -199,10 +255,38 @@ void runLinearAttnInference(int tIndex, int linearAttnIndex, int L) {
 
 	set_alpha_beta_gates<<<attnHeads_L_numBlocks, blockSize>>>(
 		laCalcs.alpha_gate,
+		laCalcs.alpha_softplus,
 		laCalcs.beta_gate,
 		laCalcs.alpha_activation, // [L, attnHeads]
 		laCalcs.beta_activation, // [L, attnHeads]
 		laWeights.alpha_to_gate_by_head_weights, // [attnHeads]
-		laWeights.alpha_to_gate_bias_by_head_weights // [attnHeads]
+		laWeights.alpha_to_gate_bias_by_head_weights, // [attnHeads]
+		L
 	);	
+}
+
+// the "linear" part will apply only during post-training inference
+void runLinearAttnGateScalingInference(int tIndex, int linearAttnIndex, int L) {
+	int blockSize = 256;
+	int attnHeads_L_L_numBlocks = (attnHeads * L * L + blockSize - 1) / blockSize;
+
+	tWeights = transformerWeights_DEVICE[tIndex];
+	laWeights = linearAttnWeights_DEVICE[linearAttnIndex];
+	tCalcs = transformerCalculations_DEVICE[tIndex];
+	laCalcs = linearAttnCalculations_DEVICE[linearAttnIndex];
+
+	compute_alpha_prefix_sum<<<attnHeads, 1>>>(
+		laCalcs.alpha_prefix_sum,
+		laCalcs.alpha_gate,
+		L		
+	);
+
+	scale_attention_by_head<<<attnHeads_L_L_numBlocks, blockSize>>>(
+		laCalcs.scaled_attnKtQByHead,
+		laCalcs.attn_alpha_beta_gate_scale,
+		tCalcs.attnKtQByHead,
+		laCalcs.alpha_prefix_sum,
+		laCalcs.beta_gate,
+		L
+	);
 }
