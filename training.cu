@@ -884,7 +884,7 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 	        CUBLAS_GEMM_DEFAULT
 	    );
 
-	    if (linearAttnIndex == -1) {
+	    if (CONFIG_ROPE && linearAttnIndex == -1) {
 			xTotalThreads = dimPairs * L;
 		    numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
 		    dLoss_d_pre_rope<<<numBlocks, threadsPerBlock>>>(
@@ -904,6 +904,8 @@ void getGradientsForTraining(int leftStartIndex, int rightEndIndex, int L) {
 		}
 
 	    if (CONFIG_QK_RMS_NORM && linearAttnIndex == -1) {
+	    	// ADD A CASE WHERE IT READS FROM keysPostRoPE / queriesPostRoPE IF RoPE is skipped!
+
             dim3 qkRMSGridDim(L, attnHeads);
 
 			preCalcRMSColWideVals_acrossHeads<<<qkRMSGridDim, 1>>>(
