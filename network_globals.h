@@ -175,6 +175,98 @@ typedef struct {
     float* embedding_weights; // [dim, vocabSize]
 } PLEOptimizerState;
 
+// ============================================================================
+// Linear attention (CONFIG_LINEAR_ATTN_by_tIndex)
+// S_t = alpha_t * S_(t-1) + beta_t * k_t v_t^T, evaluated during training in the
+// parallel ("attention matrix") form: the L x L K^T Q scores are rescaled by
+// exp(sum of log alpha between key and query) * beta_key.
+// Queries/keys/values come from the transformer's own projections, then pass through
+// a causal depthwise conv (4 taps) + SiLU; queries/keys are then L2-normalized per head.
+// Layouts: [dim, L] and [attnHeads, L, L] tensors follow the transformer conventions;
+// per-token gate tensors are [L, attnHeads] column-major (index = head * L + token).
+// ============================================================================
+
+// Linear-attention weights (device)
+typedef struct {
+    float* alpha_weights;                      // [dim, attnHeads] x_postRMS1 -> alpha (decay) activation
+    float* beta_weights;                       // [dim, attnHeads] x_postRMS1 -> beta (write gate) activation
+    float* conv_key_weights;                   // [dim, 4] per channel: channel * 4 + tap (tap 3 = current token)
+    float* conv_query_weights;                 // [dim, 4]
+    float* conv_value_weights;                 // [dim, 4]
+    float* alpha_to_gate_by_head_weights;      // [attnHeads] A_log: alpha = exp(-exp(A_log) * softplus(a + bias))
+    float* alpha_to_gate_bias_by_head_weights; // [attnHeads] bias inside the softplus
+} LinearAttnWeights;
+
+// Linear-attention forward calculation buffers (implicitly on Device).
+// Fields marked "transient" are only read within the same layer's forward pass, so
+// every linear-attention layer shares one copy (see memory_allocation.cu).
+typedef struct {
+    float* keys_post_conv;                             // [dim, L] pre-SiLU
+    float* keys_post_conv_post_silu;                   // [dim, L] transient
+    float* queries_post_conv;                          // [dim, L] pre-SiLU
+    float* queries_post_conv_post_silu;                // [dim, L] transient
+    float* values_post_conv;                           // [dim, L] pre-SiLU
+    float* values_post_conv_post_silu;                 // [dim, L]
+    float* keys_post_l2_norm;                          // [dim, L]
+    float* queries_post_l2_norm;                       // [dim, L]
+    float* keys_l2_inverse_col_sums_by_col_by_head;    // [L, attnHeads]
+    float* queries_l2_inverse_col_sums_by_col_by_head; // [L, attnHeads]
+    float* alpha_activation;                           // [L, attnHeads]
+    float* beta_activation;                            // [L, attnHeads] transient
+    float* alpha_softplus;                             // [L, attnHeads]
+    float* alpha_gate;                                 // [L, attnHeads]
+    float* beta_gate;                                  // [L, attnHeads]
+    float* alpha_prefix_sum;                           // [L, attnHeads] transient
+    float* scaled_attnKtQByHead;                       // [attnHeads, L, L]
+    float* attn_alpha_beta_gate_scale;                 // [attnHeads, L, L]
+} LinearAttnCalculations_DEVICE;
+
+// Linear-attention backprop buffers (implicitly gradients, on Device).
+// The weight gradients accumulate across all sequences of a batch (atomicAdd / += /
+// cuBLAS beta = 1); they are zeroed once at allocation and re-zeroed by the optimizer
+// after every step. All other fields are transient within one layer's backward pass
+// and are shared by every linear-attention layer (see memory_allocation.cu).
+typedef struct {
+    // weight gradients (accumulated across the batch)
+    float* alpha_weights;                      // [dim, attnHeads]
+    float* beta_weights;                       // [dim, attnHeads]
+    float* conv_key_weights;                   // [dim, 4]
+    float* conv_query_weights;                 // [dim, 4]
+    float* conv_value_weights;                 // [dim, 4]
+    float* alpha_to_gate_by_head_weights;      // [attnHeads]
+    float* alpha_to_gate_bias_by_head_weights; // [attnHeads]
+    // transient activation gradients
+    float* scaled_attnKtQByHead;                            // [attnHeads, L, L]
+    float* colGradSums;                                     // [L, attnHeads]
+    float* rowGradSums;                                     // [L, attnHeads]
+    float* alpha_gate;                                      // [L, attnHeads]
+    float* beta_gate;                                       // [L, attnHeads]
+    float* alpha_activation;                                // [L, attnHeads]
+    float* beta_activation;                                 // [L, attnHeads]
+    float* keys_features_times_grad_sums_by_col_by_head;    // [L, attnHeads]
+    float* queries_features_times_grad_sums_by_col_by_head; // [L, attnHeads]
+    float* keys_post_l2_norm;                               // [dim, L]
+    float* queries_post_l2_norm;                            // [dim, L]
+    float* keys_post_conv_post_silu;                        // [dim, L]
+    float* queries_post_conv_post_silu;                     // [dim, L]
+    float* values_post_conv_post_silu;                      // [dim, L]
+    float* keys_post_conv_pre_silu;                         // [dim, L]
+    float* queries_post_conv_pre_silu;                      // [dim, L]
+    float* values_post_conv_pre_silu;                       // [dim, L]
+} LinearAttnBackpropCalculations;
+
+// Linear-attention optimizer state (EMA / variance per weight; no separate gradient
+// accumulation buffers since the backprop weight gradients already accumulate)
+typedef struct {
+    float* alpha_weights;                      // [dim, attnHeads]
+    float* beta_weights;                       // [dim, attnHeads]
+    float* conv_key_weights;                   // [dim, 4]
+    float* conv_query_weights;                 // [dim, 4]
+    float* conv_value_weights;                 // [dim, 4]
+    float* alpha_to_gate_by_head_weights;      // [attnHeads]
+    float* alpha_to_gate_bias_by_head_weights; // [attnHeads]
+} LinearAttnOptimizerState;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -216,6 +308,23 @@ int runPLEInference(int pleIndex, int downstreamTransformerIndex, int L);
 void getGradientsForPLELayerTraining(int pleIndex, int downstreamTransformerIndex,
                                      int leftStartIndex, int rightEndIndex, int L);
 
+// Linear-attention weights and forward calculations (indexed by linear-attention layer index)
+extern LinearAttnWeights linearAttnWeights_DEVICE[linearAttnLayerSlots];
+extern LinearAttnCalculations_DEVICE linearAttnCalculations_DEVICE[linearAttnLayerSlots];
+
+// "Current layer" copies used as shorthands by linear_attention.cu,
+// training_linear_attention.cu, inference.cu, training.cu and optimizer.cu
+extern TransformerWeights tWeights;
+extern TransformerCalculations_DEVICE tCalcs;
+extern LinearAttnWeights laWeights;
+extern LinearAttnCalculations_DEVICE laCalcs;
+
+// Linear-attention forward/backward entry points (linear_attention.cu, training_linear_attention.cu)
+void runLinearAttnPreparationInference(int tIndex, int linearAttnIndex, int L);
+void runLinearAttnGateScalingInference(int tIndex, int linearAttnIndex, int L);
+void run_linear_attn_gate_unwinding_for_training(int tIndex, int linearAttnIndex, int L);
+void run_linear_attn_V_K_Q_unwinding_for_training(int tIndex, int linearAttnIndex, int L);
+
 extern float* ffn_sumByCol_RMS_DEVICE;
 extern float* ffn_postRMS_pre_gamma_DEVICE;
 extern float* ffn_postRMS_post_gamma_DEVICE;
@@ -249,6 +358,13 @@ extern BackpropCalculations backpropCalculations[transformers];
 // CONFIG_PLE backprop calculations
 extern PLEBackpropCalculations ple_backpropCalculations[pleLayers];
 
+// Linear-attention backprop calculations (indexed by linear-attention layer index)
+extern LinearAttnBackpropCalculations linearAttnBackpropCalculations[linearAttnLayerSlots];
+
+// "Current layer" backprop copies (see tCalcs / laCalcs above)
+extern BackpropCalculations tBackpropCalculations;
+extern LinearAttnBackpropCalculations laBackpropCalculations;
+
 /*
 ### OPTIMIZER STATE ###
 (implicitly on Device)
@@ -279,6 +395,15 @@ extern PLEOptimizerState pleGradientAccumulation[pleLayers];
 extern PLEOptimizerState pleFastEMA[pleLayers];
 extern PLEOptimizerState pleSlowEMA[pleLayers];
 extern PLEOptimizerState pleVariance[pleLayers];
+
+// Linear-attention optimizer state (indexed by linear-attention layer index) and the
+// "current layer" copies used by optimizer.cu
+extern LinearAttnOptimizerState laFastEMA_DEVICE[linearAttnLayerSlots];
+extern LinearAttnOptimizerState laSlowEMA_DEVICE[linearAttnLayerSlots];
+extern LinearAttnOptimizerState laVariance_DEVICE[linearAttnLayerSlots];
+extern LinearAttnOptimizerState laFastEMA;
+extern LinearAttnOptimizerState laSlowEMA;
+extern LinearAttnOptimizerState laVariance;
 
 // CONFIG_PLE: unique token indices touched across a whole batch (host + device).
 // Uploaded once per batch (after all sequences run) before the optimizer step so the

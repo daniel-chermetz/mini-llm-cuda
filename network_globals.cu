@@ -31,6 +31,16 @@ PLEWeights pleWeights[pleLayers];
 PLEWeights pleWeights_DEVICE[pleLayers];
 PLECalculations_DEVICE pleCalculations_DEVICE[pleLayers];
 
+// Linear-attention weights and forward calculations
+LinearAttnWeights linearAttnWeights_DEVICE[linearAttnLayerSlots];
+LinearAttnCalculations_DEVICE linearAttnCalculations_DEVICE[linearAttnLayerSlots];
+
+// "Current layer" shorthands
+TransformerWeights tWeights;
+TransformerCalculations_DEVICE tCalcs;
+LinearAttnWeights laWeights;
+LinearAttnCalculations_DEVICE laCalcs;
+
 float* ffn_sumByCol_RMS_DEVICE = nullptr;
 float* ffn_postRMS_pre_gamma_DEVICE = nullptr;
 float* ffn_postRMS_post_gamma_DEVICE = nullptr;
@@ -61,6 +71,11 @@ BackpropCalculations backpropCalculations[transformers];
 
 // CONFIG_PLE backprop calculations
 PLEBackpropCalculations ple_backpropCalculations[pleLayers];
+
+// Linear-attention backprop calculations and "current layer" shorthands
+LinearAttnBackpropCalculations linearAttnBackpropCalculations[linearAttnLayerSlots];
+BackpropCalculations tBackpropCalculations;
+LinearAttnBackpropCalculations laBackpropCalculations;
 
 float* x_DEVICE_grad = nullptr;
 
@@ -94,6 +109,14 @@ PLEOptimizerState pleGradientAccumulation[pleLayers];
 PLEOptimizerState pleFastEMA[pleLayers];
 PLEOptimizerState pleSlowEMA[pleLayers];
 PLEOptimizerState pleVariance[pleLayers];
+
+// Linear-attention optimizer state and "current layer" shorthands
+LinearAttnOptimizerState laFastEMA_DEVICE[linearAttnLayerSlots];
+LinearAttnOptimizerState laSlowEMA_DEVICE[linearAttnLayerSlots];
+LinearAttnOptimizerState laVariance_DEVICE[linearAttnLayerSlots];
+LinearAttnOptimizerState laFastEMA;
+LinearAttnOptimizerState laSlowEMA;
+LinearAttnOptimizerState laVariance;
 
 // CONFIG_PLE: unique token indices touched across a whole batch (host + device)
 int* unique_seqTokenIndices_batch = nullptr;

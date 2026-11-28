@@ -1,6 +1,6 @@
 /*
 nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network_globals.cu training.cu training_ple.cu \
-     inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
+     inference_orchestrator.cu memory_allocation.cu linear_attention.cu training_linear_attention.cu \
      training_orchestrator.cu training_orchestrator_instruct_helper.cu optimizer.cu random_weights.cu save_model.cu \
      -o mini_llm_cuda \
      -lcublas -lcurand \
@@ -8,7 +8,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network
 */
 /*
 nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network_globals.cu training.cu training_ple.cu \
-     inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
+     inference_orchestrator.cu memory_allocation.cu linear_attention.cu training_linear_attention.cu \
      training_orchestrator.cu training_orchestrator_instruct_helper.cu optimizer.cu random_weights.cu save_model.cu \
      -o mini_llm_cuda \
      -lcublas -lcurand \
@@ -16,7 +16,7 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network
 */
 /*
 nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network_globals.cu training.cu training_ple.cu \
-     inference_orchestrator.cu gradient_testing.cu memory_allocation.cu \
+     inference_orchestrator.cu memory_allocation.cu linear_attention.cu training_linear_attention.cu \
      training_orchestrator.cu training_orchestrator_instruct_helper.cu optimizer.cu random_weights.cu save_model.cu \
      -o mini_llm_cuda \
      -lcublas -lcurand \
@@ -38,7 +38,6 @@ nvcc main.cu ./cJSON/cJSON.c inference.cu inference_ple.cu load_model.cu network
 #include "inference.h"
 #include "training.h"
 #include "inference_orchestrator.h"
-#include "gradient_testing.h"
 #include "memory_allocation.h"
 #include "training_orchestrator.h"
 #include "random_weights.h"

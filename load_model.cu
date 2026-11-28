@@ -115,6 +115,42 @@ int readTensorColumnMajor(const unsigned char* dataBuffer, size_t* dataOffset, s
     return 1;
 }
 
+// Read a tensor whose bytes are already in device layout (no transpose), checking its
+// shape. Used for the linear-attention tensors, whose saved shapes describe the device
+// memory in row-major order.
+int readTensorAsStored(const unsigned char* dataBuffer, size_t* dataOffset, size_t fileSize,
+                       const TensorMeta* meta, const int* expectedShape, int expectedShapeDims, float* dest) {
+    if (meta->shapeDims != expectedShapeDims) {
+        printf("Error: Tensor has %d dimensions, expected %d.\n", meta->shapeDims, expectedShapeDims);
+        return 0;
+    }
+    for (int i = 0; i < expectedShapeDims; i++) {
+        if (meta->shape[i] != expectedShape[i]) {
+            printf("Error: Tensor dimension %d is %d, expected %d.\n", i, meta->shape[i], expectedShape[i]);
+            return 0;
+        }
+    }
+
+    size_t byteLength = (size_t)meta->numElements * meta->bytesPerElement;
+    if (*dataOffset + byteLength > fileSize) {
+        printf("Error: Attempting to read past buffer end.\n");
+        return 0;
+    }
+
+    const unsigned char* src = dataBuffer + *dataOffset;
+    if (meta->bytesPerElement == 4) {
+        memcpy(dest, src, byteLength);
+    } else {
+        const double* srcDouble = (const double*)src;
+        for (int i = 0; i < meta->numElements; i++) {
+            dest[i] = (float)srcDouble[i];
+        }
+    }
+
+    *dataOffset += byteLength;
+    return 1;
+}
+
 float* transposeTensorColumnMajor(float* preTransposeTensor, int preTransposeColSize, int preTransposeRowSize) {
     // preTransposeColSize :== number of rows
     // preTransposeRowSize :== number of columns
@@ -554,6 +590,70 @@ int loadModel(const char* modelName) {
             }
         } else {
             printf("Error: CONFIG_PLE is enabled but 'perLayerEmbeddings' is missing from the model file.\n");
+            success = 0;
+        }
+    }
+
+    // ========== Load linearAttentionLayers (CONFIG_LINEAR_ATTN_by_tIndex) ==========
+    // Read after PLE, in the order save_model.cu writes them; bytes are already in
+    // device layout (see save_model.cu), so they are copied without transposing.
+    if (linearAttnLayers > 0 && success) {
+        cJSON* laBlocksArr = cJSON_GetObjectItem(root, "linearAttentionLayers");
+        if (laBlocksArr && cJSON_IsArray(laBlocksArr)) {
+            int numLaBlocks = cJSON_GetArraySize(laBlocksArr);
+            if (numLaBlocks != linearAttnLayers) {
+                printf("Error: Model contains %d linear-attention layers, but this build requires %d.\n",
+                       numLaBlocks, linearAttnLayers);
+                success = 0;
+            }
+
+            // Large enough for the biggest linear-attention tensor ([attnHeads, dim] or [dim, 4])
+            size_t hostTmpFloats = (size_t)dim * (attnHeads > 4 ? attnHeads : 4);
+            float* hostTmp = (float*)malloc(hostTmpFloats * sizeof(float));
+            for (int la = 0; la < linearAttnLayers && success; la++) {
+                printf("Loading linear-attention layer %d/%d...\n", la + 1, linearAttnLayers);
+                cJSON* laObj = cJSON_GetArrayItem(laBlocksArr, la);
+
+                cJSON* tIndexObj = laObj ? cJSON_GetObjectItem(laObj, "transformerIndex") : NULL;
+                if (tIndexObj && cJSON_IsNumber(tIndexObj)) {
+                    int savedT = tIndexObj->valueint;
+                    if (savedT < 0 || savedT >= transformers || CONFIG_LINEAR_ATTN_by_tIndex[savedT] != la) {
+                        printf("Error: Linear-attention layer %d was saved for transformer %d, which does not match CONFIG_LINEAR_ATTN_by_tIndex.\n",
+                               la, savedT);
+                        success = 0;
+                        break;
+                    }
+                }
+
+                LinearAttnWeights* law = &linearAttnWeights_DEVICE[la];
+                struct { const char* jsonKey; float* devicePtr; int shape[2]; int shapeDims; } laWeightMap[] = {
+                    {"alphaWeights", law->alpha_weights, {attnHeads, dim}, 2},
+                    {"betaWeights", law->beta_weights, {attnHeads, dim}, 2},
+                    {"convKeyWeights", law->conv_key_weights, {dim, 4}, 2},
+                    {"convQueryWeights", law->conv_query_weights, {dim, 4}, 2},
+                    {"convValueWeights", law->conv_value_weights, {dim, 4}, 2},
+                    {"alphaToGateByHead", law->alpha_to_gate_by_head_weights, {attnHeads, 0}, 1},
+                    {"alphaToGateBiasByHead", law->alpha_to_gate_bias_by_head_weights, {attnHeads, 0}, 1},
+                };
+                int numLaWeights = sizeof(laWeightMap) / sizeof(laWeightMap[0]);
+
+                for (int w = 0; w < numLaWeights && success; w++) {
+                    cJSON* weightObj = laObj ? cJSON_GetObjectItem(laObj, laWeightMap[w].jsonKey) : NULL;
+                    if (!weightObj || !parseTensorMeta(weightObj, &tensorMeta)) {
+                        printf("Error: '%s' missing or invalid in linear-attention layer %d\n", laWeightMap[w].jsonKey, la);
+                        success = 0;
+                    } else if (!readTensorAsStored(fileBuffer, &dataOffset, fileSize, &tensorMeta,
+                                                   laWeightMap[w].shape, laWeightMap[w].shapeDims, hostTmp)) {
+                        printf("Error: Failed to read '%s' of linear-attention layer %d\n", laWeightMap[w].jsonKey, la);
+                        success = 0;
+                    } else {
+                        cudaMemcpy(laWeightMap[w].devicePtr, hostTmp, tensorMeta.numElements * sizeof(float), cudaMemcpyHostToDevice);
+                    }
+                }
+            }
+            free(hostTmp);
+        } else {
+            printf("Error: CONFIG_LINEAR_ATTN_by_tIndex has linear-attention layers but 'linearAttentionLayers' is missing from the model file.\n");
             success = 0;
         }
     }

@@ -72,6 +72,13 @@ void saveModelWeights(const char* filename, int iterationNum) {
             totalElements += dim;             // pleGamma
         }
     }
+
+    // Linear-attention tensors
+    for (int la = 0; la < linearAttnLayers; la++) {
+        totalElements += 2 * attnHeads * dim; // alphaWeights, betaWeights
+        totalElements += 3 * dim * 4;         // convKeyWeights, convQueryWeights, convValueWeights
+        totalElements += 2 * attnHeads;       // alphaToGateByHead, alphaToGateBiasByHead
+    }
     
     // Allocate host buffer for all weights
     float* hostBuffer = (float*)malloc(totalElements * sizeof(float));
@@ -173,6 +180,41 @@ void saveModelWeights(const char* filename, int iterationNum) {
             cJSON_AddItemToArray(pleBlocks, pleMeta);
         }
         cJSON_AddItemToObject(metadata, "perLayerEmbeddings", pleBlocks);
+    }
+
+    // Linear-attention layers, written after PLE (the loader reads in this same order),
+    // in linear-attention index order. Each shape describes the tensor's bytes in
+    // row-major order exactly as they sit in device memory:
+    //   alphaWeights / betaWeights   [attnHeads, dim] (device [dim, attnHeads] column-major)
+    //   conv*Weights                 [dim, 4]         (channel * 4 + tap, tap 3 = current token)
+    //   alphaToGateByHead            [attnHeads]      (A_log)
+    //   alphaToGateBiasByHead        [attnHeads]      (bias inside the softplus)
+    if (linearAttnLayers > 0) {
+        cJSON* linearAttnBlocks = cJSON_CreateArray();
+        for (int la = 0; la < linearAttnLayers; la++) {
+            cJSON* laMeta = cJSON_CreateObject();
+            for (int t = 0; t < transformers; t++) {
+                if (CONFIG_LINEAR_ATTN_by_tIndex[t] == la) {
+                    cJSON_AddNumberToObject(laMeta, "transformerIndex", t);
+                }
+            }
+
+            shape2D[0] = attnHeads; shape2D[1] = dim;
+            offset += addTensorToSave(laMeta, "alphaWeights", linearAttnWeights_DEVICE[la].alpha_weights, shape2D, 2, hostBuffer, offset);
+            offset += addTensorToSave(laMeta, "betaWeights", linearAttnWeights_DEVICE[la].beta_weights, shape2D, 2, hostBuffer, offset);
+
+            shape2D[0] = dim; shape2D[1] = 4;
+            offset += addTensorToSave(laMeta, "convKeyWeights", linearAttnWeights_DEVICE[la].conv_key_weights, shape2D, 2, hostBuffer, offset);
+            offset += addTensorToSave(laMeta, "convQueryWeights", linearAttnWeights_DEVICE[la].conv_query_weights, shape2D, 2, hostBuffer, offset);
+            offset += addTensorToSave(laMeta, "convValueWeights", linearAttnWeights_DEVICE[la].conv_value_weights, shape2D, 2, hostBuffer, offset);
+
+            shape1D[0] = attnHeads;
+            offset += addTensorToSave(laMeta, "alphaToGateByHead", linearAttnWeights_DEVICE[la].alpha_to_gate_by_head_weights, shape1D, 1, hostBuffer, offset);
+            offset += addTensorToSave(laMeta, "alphaToGateBiasByHead", linearAttnWeights_DEVICE[la].alpha_to_gate_bias_by_head_weights, shape1D, 1, hostBuffer, offset);
+
+            cJSON_AddItemToArray(linearAttnBlocks, laMeta);
+        }
+        cJSON_AddItemToObject(metadata, "linearAttentionLayers", linearAttnBlocks);
     }
     
     // Convert metadata to string

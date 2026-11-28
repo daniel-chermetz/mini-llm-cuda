@@ -510,19 +510,19 @@ void run_linear_attn_V_K_Q_unwinding_for_training(int tIndex, int linearAttnInde
 		L
 	);	
 
-	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
+	compute_x_pre_conv_grads<<<dim_L_numBlocks, blockSize>>>(
 		tBackpropCalculations.keysPreRoPE,
 		laBackpropCalculations.keys_post_conv_pre_silu,
 		laWeights.conv_key_weights,
 		L
 	);
-	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
+	compute_x_pre_conv_grads<<<dim_L_numBlocks, blockSize>>>(
 		tBackpropCalculations.queriesPreRoPE,
 		laBackpropCalculations.queries_post_conv_pre_silu,
 		laWeights.conv_query_weights,
 		L
 	);
-	compute_x_pre_conv_grads<<<attnHeads_L_numBlocks, blockSize>>>(
+	compute_x_pre_conv_grads<<<dim_L_numBlocks, blockSize>>>(
 		tBackpropCalculations.values,
 		laBackpropCalculations.values_post_conv_pre_silu,
 		laWeights.conv_value_weights,

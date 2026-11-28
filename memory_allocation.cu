@@ -11,6 +11,191 @@
 #include "training_orchestrator.h"
 
 // ============================================================================
+// LINEAR ATTENTION MEMORY
+// ============================================================================
+//
+// Each linear-attention layer gets its own memory only for the forward tensors that
+// its backward pass reads. Tensors that live only within one layer's forward pass, or
+// only within one layer's backward pass, are views into a single workspace shared by
+// every linear-attention layer. The forward and backward views overlap inside that
+// workspace: all work is issued on the default stream, and a forward pass is always
+// complete before the backward pass that follows it starts.
+//
+// The RoPE / QK RMS norm / softmax buffers of a linear-attention transformer are never
+// touched, so they are not allocated at all (they stay nullptr).
+
+// Hands out consecutive, 256-byte aligned float views of one device allocation.
+// With base == nullptr it only measures the size needed.
+typedef struct {
+    float* base;
+    size_t usedFloats;
+} DeviceFloatArena;
+
+static float* arenaTake(DeviceFloatArena* arena, size_t numFloats) {
+    const size_t alignFloats = 64;
+    float* view = arena->base ? arena->base + arena->usedFloats : nullptr;
+    arena->usedFloats += (numFloats + alignFloats - 1) / alignFloats * alignFloats;
+    return view;
+}
+
+static float* cudaMallocZeroedFloats(size_t numFloats) {
+    float* ptr = nullptr;
+    cudaMalloc((void**)&ptr, numFloats * sizeof(float));
+    cudaMemset(ptr, 0, numFloats * sizeof(float));
+    return ptr;
+}
+
+// Forward-transient tensors: the raw K^T Q scores (rescaled straight into
+// scaled_attnKtQByHead), the SiLU outputs feeding the query/key L2 norms, the beta
+// pre-activation and the log-alpha prefix sums.
+static void carveLinearAttnForwardScratch(DeviceFloatArena* arena, float** rawAttnKtQByHead, LinearAttnCalculations_DEVICE* calcs) {
+    *rawAttnKtQByHead = arenaTake(arena, (size_t)attnHeads * maxL * maxL);
+    calcs->keys_post_conv_post_silu = arenaTake(arena, (size_t)dim * maxL);
+    calcs->queries_post_conv_post_silu = arenaTake(arena, (size_t)dim * maxL);
+    calcs->beta_activation = arenaTake(arena, (size_t)attnHeads * maxL);
+    calcs->alpha_prefix_sum = arenaTake(arena, (size_t)attnHeads * maxL);
+}
+
+// Backward-transient tensors: every activation gradient of the linear-attention path,
+// plus the gradient of the raw K^T Q scores (backpropCalculations[t].attnKtQByHead).
+static void carveLinearAttnBackwardScratch(DeviceFloatArena* arena, float** rawAttnKtQByHeadGrad, LinearAttnBackpropCalculations* grads) {
+    *rawAttnKtQByHeadGrad = arenaTake(arena, (size_t)attnHeads * maxL * maxL);
+    grads->scaled_attnKtQByHead = arenaTake(arena, (size_t)attnHeads * maxL * maxL);
+
+    grads->colGradSums = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->rowGradSums = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->alpha_gate = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->beta_gate = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->alpha_activation = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->beta_activation = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->keys_features_times_grad_sums_by_col_by_head = arenaTake(arena, (size_t)attnHeads * maxL);
+    grads->queries_features_times_grad_sums_by_col_by_head = arenaTake(arena, (size_t)attnHeads * maxL);
+
+    grads->keys_post_l2_norm = arenaTake(arena, (size_t)dim * maxL);
+    grads->queries_post_l2_norm = arenaTake(arena, (size_t)dim * maxL);
+    grads->keys_post_conv_post_silu = arenaTake(arena, (size_t)dim * maxL);
+    grads->queries_post_conv_post_silu = arenaTake(arena, (size_t)dim * maxL);
+    grads->values_post_conv_post_silu = arenaTake(arena, (size_t)dim * maxL);
+    grads->keys_post_conv_pre_silu = arenaTake(arena, (size_t)dim * maxL);
+    grads->queries_post_conv_pre_silu = arenaTake(arena, (size_t)dim * maxL);
+    grads->values_post_conv_pre_silu = arenaTake(arena, (size_t)dim * maxL);
+}
+
+// Shared backward views, set up by allocateLinearAttnMemory (when training) and copied
+// into every layer's backprop struct by allocateLinearAttnTrainingMemory.
+static float* linearAttnRawAttnKtQByHeadGrad = nullptr;
+static LinearAttnBackpropCalculations linearAttnBackwardScratch = {};
+
+static void allocateLinearAttnMemory(bool allocateTraining) {
+    if (linearAttnLayers == 0) {
+        return;
+    }
+
+    // Size the shared workspace: max of the forward and (if training) backward views.
+    float* rawAttnKtQByHead = nullptr;
+    LinearAttnCalculations_DEVICE forwardScratch = {};
+
+    DeviceFloatArena measureForward = {nullptr, 0};
+    carveLinearAttnForwardScratch(&measureForward, &rawAttnKtQByHead, &forwardScratch);
+    size_t workspaceFloats = measureForward.usedFloats;
+    if (allocateTraining) {
+        DeviceFloatArena measureBackward = {nullptr, 0};
+        carveLinearAttnBackwardScratch(&measureBackward, &linearAttnRawAttnKtQByHeadGrad, &linearAttnBackwardScratch);
+        if (measureBackward.usedFloats > workspaceFloats) {
+            workspaceFloats = measureBackward.usedFloats;
+        }
+    }
+
+    float* workspace = nullptr;
+    cudaMalloc((void**)&workspace, workspaceFloats * sizeof(float));
+
+    DeviceFloatArena forwardArena = {workspace, 0};
+    carveLinearAttnForwardScratch(&forwardArena, &rawAttnKtQByHead, &forwardScratch);
+    if (allocateTraining) {
+        DeviceFloatArena backwardArena = {workspace, 0};
+        carveLinearAttnBackwardScratch(&backwardArena, &linearAttnRawAttnKtQByHeadGrad, &linearAttnBackwardScratch);
+    }
+
+    printf("Linear attention: %d layer(s), shared workspace %.1f MB\n",
+           linearAttnLayers, (double)workspaceFloats * sizeof(float) / (1024.0 * 1024.0));
+
+    for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
+        int linearAttnIndex = CONFIG_LINEAR_ATTN_by_tIndex[transformerIndex];
+        if (linearAttnIndex == -1) {
+            continue;
+        }
+
+        transformerCalculations_DEVICE[transformerIndex].attnKtQByHead = rawAttnKtQByHead;
+
+        // Weights (initialized by initializeRandomWeights / loadModel)
+        LinearAttnWeights* weights = &linearAttnWeights_DEVICE[linearAttnIndex];
+        cudaMalloc((void**)&weights->alpha_weights, dim * attnHeads * sizeof(float));
+        cudaMalloc((void**)&weights->beta_weights, dim * attnHeads * sizeof(float));
+        cudaMalloc((void**)&weights->conv_key_weights, dim * 4 * sizeof(float));
+        cudaMalloc((void**)&weights->conv_query_weights, dim * 4 * sizeof(float));
+        cudaMalloc((void**)&weights->conv_value_weights, dim * 4 * sizeof(float));
+        cudaMalloc((void**)&weights->alpha_to_gate_by_head_weights, attnHeads * sizeof(float));
+        cudaMalloc((void**)&weights->alpha_to_gate_bias_by_head_weights, attnHeads * sizeof(float));
+
+        // Forward tensors: shared transient views + per-layer tensors read by the backward pass
+        LinearAttnCalculations_DEVICE* calcs = &linearAttnCalculations_DEVICE[linearAttnIndex];
+        *calcs = forwardScratch;
+        cudaMalloc((void**)&calcs->keys_post_conv, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->queries_post_conv, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->values_post_conv, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->values_post_conv_post_silu, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->keys_post_l2_norm, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->queries_post_l2_norm, dim * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->keys_l2_inverse_col_sums_by_col_by_head, attnHeads * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->queries_l2_inverse_col_sums_by_col_by_head, attnHeads * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->alpha_activation, attnHeads * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->alpha_softplus, attnHeads * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->alpha_gate, attnHeads * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->beta_gate, attnHeads * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->scaled_attnKtQByHead, (size_t)attnHeads * maxL * maxL * sizeof(float));
+        cudaMalloc((void**)&calcs->attn_alpha_beta_gate_scale, (size_t)attnHeads * maxL * maxL * sizeof(float));
+    }
+}
+
+static void allocateLinearAttnOptimizerState(LinearAttnOptimizerState* state) {
+    state->alpha_weights = cudaMallocZeroedFloats(dim * attnHeads);
+    state->beta_weights = cudaMallocZeroedFloats(dim * attnHeads);
+    state->conv_key_weights = cudaMallocZeroedFloats(dim * 4);
+    state->conv_query_weights = cudaMallocZeroedFloats(dim * 4);
+    state->conv_value_weights = cudaMallocZeroedFloats(dim * 4);
+    state->alpha_to_gate_by_head_weights = cudaMallocZeroedFloats(attnHeads);
+    state->alpha_to_gate_bias_by_head_weights = cudaMallocZeroedFloats(attnHeads);
+}
+
+static void allocateLinearAttnTrainingMemory() {
+    for (int transformerIndex = 0; transformerIndex < transformers; transformerIndex++) {
+        int linearAttnIndex = CONFIG_LINEAR_ATTN_by_tIndex[transformerIndex];
+        if (linearAttnIndex == -1) {
+            continue;
+        }
+
+        backpropCalculations[transformerIndex].attnKtQByHead = linearAttnRawAttnKtQByHeadGrad;
+
+        // Shared transient views + per-layer weight gradients. The weight gradients are
+        // summed across every sequence of a batch (atomicAdd / += / cuBLAS beta = 1), so
+        // they start at zero here; the optimizer re-zeroes them after each step.
+        LinearAttnBackpropCalculations* grads = &linearAttnBackpropCalculations[linearAttnIndex];
+        *grads = linearAttnBackwardScratch;
+        grads->alpha_weights = cudaMallocZeroedFloats(dim * attnHeads);
+        grads->beta_weights = cudaMallocZeroedFloats(dim * attnHeads);
+        grads->conv_key_weights = cudaMallocZeroedFloats(dim * 4);
+        grads->conv_query_weights = cudaMallocZeroedFloats(dim * 4);
+        grads->conv_value_weights = cudaMallocZeroedFloats(dim * 4);
+        grads->alpha_to_gate_by_head_weights = cudaMallocZeroedFloats(attnHeads);
+        grads->alpha_to_gate_bias_by_head_weights = cudaMallocZeroedFloats(attnHeads);
+
+        allocateLinearAttnOptimizerState(&laFastEMA_DEVICE[linearAttnIndex]);
+        allocateLinearAttnOptimizerState(&laSlowEMA_DEVICE[linearAttnIndex]);
+        allocateLinearAttnOptimizerState(&laVariance_DEVICE[linearAttnIndex]);
+    }
+}
+
+// ============================================================================
 // BATCH GRADIENT ACCUMULATION MEMORY
 // ============================================================================
 
@@ -295,21 +480,32 @@ static void allocateTrainingMemory() {
         cudaMalloc((void**)&backpropCalculations[transformerIndex].output_proj_weights, dim * dim * sizeof(float));
 
         cudaMalloc((void**)&backpropCalculations[transformerIndex].values, dim * maxL * sizeof(float));
-        cudaMalloc((void**)&backpropCalculations[transformerIndex].attnByHead_postSoftmax, attnHeads * maxL * maxL * sizeof(float));
-        cudaMalloc((void**)&backpropCalculations[transformerIndex].attnSoftmaxGradSumByCol, attnHeads * maxL * sizeof(float));
-        cudaMalloc((void**)&backpropCalculations[transformerIndex].attnKtQByHead, attnHeads * maxL * maxL * sizeof(float));
 
-        cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPostRoPE, dim * maxL * sizeof(float));
+        // Linear-attention transformers use their own (shared) buffers for the score and
+        // q/k gradients, and get attnKtQByHead from the shared workspace
+        // (allocateLinearAttnTrainingMemory), so the softmax-only buffers are skipped.
+        bool isLinearAttn = CONFIG_LINEAR_ATTN_by_tIndex[transformerIndex] != -1;
+        if (!isLinearAttn) {
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnByHead_postSoftmax, attnHeads * maxL * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnSoftmaxGradSumByCol, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].attnKtQByHead, attnHeads * maxL * maxL * sizeof(float));
+
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPostRoPE, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPostRoPE, dim * maxL * sizeof(float));
+        }
         cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPreRoPE, dim * maxL * sizeof(float));
-        cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPostRoPE, dim * maxL * sizeof(float));
         cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPreRoPE, dim * maxL * sizeof(float));
 
-        // CONFIG_QK_RMS_NORM backprop buffers
+        // CONFIG_QK_RMS_NORM backprop buffers (linear-attention transformers skip QK RMS norm;
+        // their gamma gradients are still allocated because the batch accumulation copies
+        // them for every transformer)
         if (CONFIG_QK_RMS_NORM) {
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPreRoPE_preRMS, dim * maxL * sizeof(float));
-            cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPreRoPE_preRMS, dim * maxL * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].query_gamma_weights, dim * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].key_gamma_weights, dim * sizeof(float));
+        }
+        if (CONFIG_QK_RMS_NORM && !isLinearAttn) {
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].queriesPreRoPE_preRMS, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&backpropCalculations[transformerIndex].keysPreRoPE_preRMS, dim * maxL * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_queries_sigma_scale_x_upGrad_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_queries_oneOverR_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
             cudaMalloc((void**)&backpropCalculations[transformerIndex].rms_queries_oneOverHeadDimR3_byCol_RMS_byHead, attnHeads * maxL * sizeof(float));
@@ -351,6 +547,9 @@ static void allocateTrainingMemory() {
     if (CONFIG_PLE) {
         allocatePLETrainingMemory();
     }
+
+    // Linear-attention gradients (zeroed) and optimizer state
+    allocateLinearAttnTrainingMemory();
 
     // Allocate beta power stores (10M iterations capacity)
     // Index 0 is placeholder (iteration starts at 1 to avoid division by zero)
@@ -558,13 +757,16 @@ void allocateMemory(bool allocateTraining) {
         }
 
         // Transformer calculation buffers (allocated at maxL capacity)
+        // Linear-attention transformers skip RoPE, QK RMS norm and softmax; their raw
+        // K^T Q scores come from the shared linear-attention workspace (allocateLinearAttnMemory).
+        bool isLinearAttn = CONFIG_LINEAR_ATTN_by_tIndex[transformerIndex] != -1;
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_sumByCol_RMS1, maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_postRMS1_pre_gamma, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].x_postRMS1_post_gamma, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].values, dim * maxL * sizeof(float));
-        if (CONFIG_QK_RMS_NORM) {
+        if (CONFIG_QK_RMS_NORM && !isLinearAttn) {
             cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries_RMS_sumByColByHead, attnHeads * maxL * sizeof(float));
             cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys_RMS_sumByColByHead, attnHeads * maxL * sizeof(float));
             cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queries_post_RMS_pre_gamma, dim * maxL * sizeof(float));
@@ -572,14 +774,16 @@ void allocateMemory(bool allocateTraining) {
             cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys_post_RMS_pre_gamma, dim * maxL * sizeof(float));
             cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keys_postRMS_post_gamma, dim * maxL * sizeof(float));
         }
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queriesPostRoPE, dim * maxL * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keysPostRoPE, dim * maxL * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHead, attnHeads * maxL * maxL * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHeadScaledMasked, attnHeads * maxL * maxL * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_maxByCol_softmax, attnHeads * maxL * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_sumByCol_softmax, attnHeads * maxL * sizeof(float));
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_expfCache_softmax, attnHeads * maxL * maxL * sizeof(float));        
-        cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_postSoftmax, attnHeads * maxL * maxL * sizeof(float));
+        if (!isLinearAttn) {
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].queriesPostRoPE, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].keysPostRoPE, dim * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHead, attnHeads * maxL * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnKtQByHeadScaledMasked, attnHeads * maxL * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_maxByCol_softmax, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_sumByCol_softmax, attnHeads * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_expfCache_softmax, attnHeads * maxL * maxL * sizeof(float));
+            cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].attnByHead_postSoftmax, attnHeads * maxL * maxL * sizeof(float));
+        }
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].valueScaledSoftmaxAttn, dim * maxL * sizeof(float));
         if (CONFIG_QUERY_GATING) {
             cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].gatedQueries, dim * maxL * sizeof(float));
@@ -598,6 +802,10 @@ void allocateMemory(bool allocateTraining) {
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffn_final, dim * maxL * sizeof(float));
         cudaMalloc((void**)&transformerCalculations_DEVICE[transformerIndex].ffnPlusResidual, dim * maxL * sizeof(float));
     }
+
+    // Linear-attention weights, forward buffers and shared workspace (sized for the
+    // backward pass too when training)
+    allocateLinearAttnMemory(allocateTraining);
 
     // ========================================================================
     // CONFIG_PLE weights (host mirror + device) and forward calculation buffers

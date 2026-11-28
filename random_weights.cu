@@ -31,6 +31,51 @@ __global__ void initConstantWeights(float* weights, int size, float value) {
     weights[idx] = value;
 }
 
+// Mamba-2 style decay-gate init, per head:
+//   A_log = log(A), A ~ U[1, 16]
+//   bias  = softplus^-1(dt), dt log-uniform in [1e-3, 1e-1]
+// so at init alpha = exp(-A * dt) lies roughly in [0.2, 0.999].
+__global__ void initLinearAttnGateWeights(float* alpha_to_gate_by_head_weights, float* alpha_to_gate_bias_by_head_weights, unsigned long seed) {
+    int headIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (headIndex >= attnHeads) return;
+
+    curandState state;
+    curand_init(seed, headIndex, 0, &state);
+
+    float A = 1.0f + 15.0f * curand_uniform(&state);
+    alpha_to_gate_by_head_weights[headIndex] = logf(A);
+
+    const float dtMin = 1e-3f;
+    const float dtMax = 1e-1f;
+    float dt = expf(logf(dtMin) + curand_uniform(&state) * (logf(dtMax) - logf(dtMin)));
+    dt = fmaxf(dt, 1e-4f);
+    alpha_to_gate_bias_by_head_weights[headIndex] = dt + logf(-expm1f(-dt));
+}
+
+void initializeLinearAttnWeights(float range, unsigned long seed) {
+    int numBlocks;
+    int size;
+
+    for (int linearAttnIndex = 0; linearAttnIndex < linearAttnLayers; linearAttnIndex++) {
+        LinearAttnWeights* weights = &linearAttnWeights_DEVICE[linearAttnIndex];
+
+        // alpha / beta projections (dim x attnHeads): like the other projections
+        size = dim * attnHeads;
+        numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+        initRandomWeights<<<numBlocks, threadsPerBlock>>>(weights->alpha_weights, size, range, seed++);
+        initRandomWeights<<<numBlocks, threadsPerBlock>>>(weights->beta_weights, size, range, seed++);
+
+        // Causal conv taps (dim x 4): PyTorch Conv1d default bound 1/sqrt(kernel size)
+        size = dim * 4;
+        numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+        initRandomWeights<<<numBlocks, threadsPerBlock>>>(weights->conv_key_weights, size, 0.5f, seed++);
+        initRandomWeights<<<numBlocks, threadsPerBlock>>>(weights->conv_query_weights, size, 0.5f, seed++);
+        initRandomWeights<<<numBlocks, threadsPerBlock>>>(weights->conv_value_weights, size, 0.5f, seed++);
+
+        initLinearAttnGateWeights<<<1, attnHeads>>>(weights->alpha_to_gate_by_head_weights, weights->alpha_to_gate_bias_by_head_weights, seed++);
+    }
+}
+
 void initializeRandomWeights(float range) {
     printf("\n=== Initializing Random Weights (range: [-%.4f, +%.4f]) ===\n", range, range);
     
@@ -129,6 +174,12 @@ void initializeRandomWeights(float range) {
 
             printf("  PLE layer %d weights initialized\n", pleIndex);
         }
+    }
+
+    // Linear-attention weights (projections, conv taps, decay gate)
+    if (linearAttnLayers > 0) {
+        initializeLinearAttnWeights(range, seed);
+        printf("  Linear attention weights initialized (%d layers)\n", linearAttnLayers);
     }
     
     cudaDeviceSynchronize();

@@ -389,7 +389,6 @@ int runInference(int L) {
         bool consume_last_ple_result = (CONFIG_PLE && pleIndex != -1);
 
         int linearAttnIndex = CONFIG_LINEAR_ATTN_by_tIndex[tIndex];
-        laCalcs;
         if (linearAttnIndex != -1) {
             laCalcs = linearAttnCalculations_DEVICE[linearAttnIndex];
         }

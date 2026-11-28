@@ -38,6 +38,31 @@ __global__ void update_optimizer_intermediates(
   	variance[index] = BETA2_ * variance[index] + (1.0f - BETA2_) * averagedGrad * averagedGrad;
 }
 
+__global__ void update_optimizer_intermediates_with_grad_reset(
+	float* fastEMA,
+	float* slowEMA,
+	float* variance,
+	float* grad,
+	float BETA1_, 
+	float BETA2_, 
+	float BETA3_, 
+	int batchSize, 
+	int gradSize
+) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= gradSize) {
+    	return;
+    }
+
+    float averagedGrad = grad[index] / (float) batchSize;
+
+    fastEMA[index] = BETA1_ * fastEMA[index] + (1.0f - BETA1_) * averagedGrad;
+    slowEMA[index] = BETA3_ * slowEMA[index] + (1.0f - BETA3_) * averagedGrad;
+  	variance[index] = BETA2_ * variance[index] + (1.0f - BETA2_) * averagedGrad * averagedGrad;
+
+  	grad[index] = 0.0f;
+}
+
 // iterationNum starts with 1
 __global__ void update_weights_per_adeamix(
 	float* weight, 
@@ -270,7 +295,7 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate, int batchToke
 			if (pleIndex != -1) {
 				// PLE Weights (dim x dim)
 				update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(pleFastEMA[pleIndex].ple_weights, pleSlowEMA[pleIndex].ple_weights, pleVariance[pleIndex].ple_weights, pleGradientAccumulation[pleIndex].ple_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
-				update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].ple_weights, pleFastEMA[pleIndex].ple_weights, pleSlowEMA[pleIndex].ple_weights, pleVariance[pleIndex].ple_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);				
+				update_weights_per_adeamix<<<numBlocks, threadsPerBlock>>>(pleWeights_DEVICE[pleIndex].ple_weights, pleFastEMA[pleIndex].ple_weights, pleSlowEMA[pleIndex].ple_weights, pleVariance[pleIndex].ple_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 			}
 		}
 
@@ -280,7 +305,9 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate, int batchToke
 		update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(fastEMA[t].rms1_gamma_weights, slowEMA[t].rms1_gamma_weights, variance[t].rms1_gamma_weights, gradientAccumulation[t].rms1_gamma_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
 		update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].rms1_weights, fastEMA[t].rms1_gamma_weights, slowEMA[t].rms1_gamma_weights, variance[t].rms1_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
 
-        if (CONFIG_QK_RMS_NORM) {
+        int linearAttnIndex = CONFIG_LINEAR_ATTN_by_tIndex[t];
+
+        if (CONFIG_QK_RMS_NORM && linearAttnIndex == -1) {
 			// Query RMS Gamma Weights (dim)
 			update_optimizer_intermediates<<<numBlocks, threadsPerBlock>>>(fastEMA[t].query_gamma_weights, slowEMA[t].query_gamma_weights, variance[t].query_gamma_weights, gradientAccumulation[t].query_gamma_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
 			update_weights_per_adeamix_decay_relative_to_one<<<numBlocks, threadsPerBlock>>>(transformerWeights_DEVICE[t].query_RMS_weights, fastEMA[t].query_gamma_weights, slowEMA[t].query_gamma_weights, variance[t].query_gamma_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, ADEAMIX_WEIGHT_DECAY, xTotalThreads);
@@ -302,5 +329,42 @@ void apply_adeamix_optimizer(int iterationNum, float learningRate, int batchToke
 				ple_update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(unique_seqTokenIndices_batch_DEVICE, pleWeights_DEVICE[pleIndex].embedding_weights, pleFastEMA[pleIndex].embedding_weights, pleSlowEMA[pleIndex].embedding_weights, pleVariance[pleIndex].embedding_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
 			}
         }
+    	if (linearAttnIndex != -1) {
+    		laWeights = linearAttnWeights_DEVICE[linearAttnIndex];
+    		laBackpropCalculations = linearAttnBackpropCalculations[linearAttnIndex];
+    		laFastEMA = laFastEMA_DEVICE[linearAttnIndex];
+    		laSlowEMA = laSlowEMA_DEVICE[linearAttnIndex];
+    		laVariance = laVariance_DEVICE[linearAttnIndex];
+
+    		xTotalThreads = dim * attnHeads;
+    		numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+    		update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.alpha_weights, laSlowEMA.alpha_weights, laVariance.alpha_weights, laBackpropCalculations.alpha_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.alpha_weights, laFastEMA.alpha_weights, laSlowEMA.alpha_weights, laVariance.alpha_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+
+			update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.beta_weights, laSlowEMA.beta_weights, laVariance.beta_weights, laBackpropCalculations.beta_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.beta_weights, laFastEMA.beta_weights, laSlowEMA.beta_weights, laVariance.beta_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+
+			xTotalThreads = 4 * dim;
+			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+			update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.conv_key_weights, laSlowEMA.conv_key_weights, laVariance.conv_key_weights, laBackpropCalculations.conv_key_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.conv_key_weights, laFastEMA.conv_key_weights, laSlowEMA.conv_key_weights, laVariance.conv_key_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+
+			update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.conv_query_weights, laSlowEMA.conv_query_weights, laVariance.conv_query_weights, laBackpropCalculations.conv_query_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.conv_query_weights, laFastEMA.conv_query_weights, laSlowEMA.conv_query_weights, laVariance.conv_query_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+
+			update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.conv_value_weights, laSlowEMA.conv_value_weights, laVariance.conv_value_weights, laBackpropCalculations.conv_value_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.conv_value_weights, laFastEMA.conv_value_weights, laSlowEMA.conv_value_weights, laVariance.conv_value_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+
+			xTotalThreads = attnHeads;
+			numBlocks = (xTotalThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+			update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.alpha_to_gate_by_head_weights, laSlowEMA.alpha_to_gate_by_head_weights, laVariance.alpha_to_gate_by_head_weights, laBackpropCalculations.alpha_to_gate_by_head_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.alpha_to_gate_by_head_weights, laFastEMA.alpha_to_gate_by_head_weights, laSlowEMA.alpha_to_gate_by_head_weights, laVariance.alpha_to_gate_by_head_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);
+
+			update_optimizer_intermediates_with_grad_reset<<<numBlocks, threadsPerBlock>>>(laFastEMA.alpha_to_gate_bias_by_head_weights, laSlowEMA.alpha_to_gate_bias_by_head_weights, laVariance.alpha_to_gate_bias_by_head_weights, laBackpropCalculations.alpha_to_gate_bias_by_head_weights, ADEAMIX_BETA1, ADEAMIX_BETA2, ADEAMIX_BETA3, TRAINING_BATCH_SIZE, xTotalThreads);
+			update_weights_per_adeamix_no_decay<<<numBlocks, threadsPerBlock>>>(laWeights.alpha_to_gate_bias_by_head_weights, laFastEMA.alpha_to_gate_bias_by_head_weights, laSlowEMA.alpha_to_gate_bias_by_head_weights, laVariance.alpha_to_gate_bias_by_head_weights, beta1_pow_store, beta2_pow_store, beta3_pow_store, learningRate, iterationNum, ADEAMIX_ALPHA, xTotalThreads);				
+    	}
 	}
 }

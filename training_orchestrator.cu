@@ -34,7 +34,7 @@
 #define PRINT_EVERY_N_BATCHES 50
 
 // Save frequency: save model every N optimizer iterations (100k = 100000)
-#define SAVE_EVERY_N_ITERATIONS 30000
+#define SAVE_EVERY_N_ITERATIONS 10000
 
 // Model save path template (iteration number will be inserted)
 #define MODEL_SAVE_PATH "./model/victorian_weights_iter_%d.bin"
@@ -479,9 +479,9 @@ static SequenceLossResult processSequence(int storyIndex, bool computeLoss, bool
 // ============================================================================
 
 // Learning rate warmup configuration
-#define LR_START 9e-6f        // Starting learning rate
-#define LR_END 3e-5f          // Final learning rate after warmup
-#define LR_WARMUP_STEPS 13000 // Number of iterations for warmup
+#define LR_START 1e-5f        // Starting learning rate
+#define LR_END 5e-5f          // Final learning rate after warmup
+#define LR_WARMUP_STEPS 10000 // Number of iterations for warmup
 
 // Calculate learning rate with linear warmup
 static float getLearningRate(int iteration) {
@@ -670,11 +670,11 @@ int runTrainingLoop(void) {
                 snprintf(saveFilePath, sizeof(saveFilePath), MODEL_SAVE_PATH, globalIterationCount);
                 saveModelWeights(saveFilePath, globalIterationCount);
             }
-            /*if (globalIterationCount > 0 && globalIterationCount % 30 == 0) {
-                // Rest period after every 30 batches to let GPU cool down
-                printf("Resting for 13 seconds...\n");
-                sleep(13);
-            }*/
+            if (globalIterationCount > 0 && globalIterationCount % 64 == 0) {
+                // Rest period after every 64 batches to let GPU cool down
+                printf("Resting for 6 seconds...\n");
+                sleep(6);
+            }
         }
         
         printf("Finished processing file %d.\n\n", fileIndex);
